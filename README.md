@@ -18,6 +18,8 @@ h.feed(b"$6144\r\n" + vector_bytes + b"\r\n")
 table, arena = h.gets()                     # n*24 bytes: (offset, length, type)
 off, length, resp_type = struct.unpack_from("<qqq", table, 0)
 arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
+# many slices: read the table in one call (don't struct.unpack per slice)
+triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
 ```
 
 ## Features
