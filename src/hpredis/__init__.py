@@ -136,15 +136,22 @@ class Reader:
         return replies
 
     def _highway_gets(self):
-        status, addr, count = self._core.highway_gets()
+        """Highway mode returns (table, arena) for a complete reply.
+
+        table is n*24 bytes of little-endian int64 triples
+        (offset, length, resp_type) with offsets into arena, which is the
+        bytearray holding the reply.  Read payloads natively:
+            off, length, typ = struct.unpack_from("<qqq", table, i * 24)
+            arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
+        A view of the arena owns its data: it stays valid across feeds (the
+        core moves to a fresh arena instead of resizing an exported one).
+        """
+        status, table, arena = self._core.highway_gets()
         if status == 1:
             return self._notEnoughData
-        if status != 0:
-            raise self._protocolError("Protocol error")
-        return (addr, count)
-
-    def highway_slice(self, i):
-        return self._core.highway_slice(i)
+        if status == 2:
+            raise self._protocolError(self._decode_msg(table))
+        return (table, arena)
 
     def set_encoding(self, encoding=None, errors=None):
         """hiredis parity: change encoding/errors; validates eagerly."""
@@ -234,14 +241,6 @@ class Reader:
         ):
             return obj.decode(self._encoding, self._errors or "strict")
         return obj
-
-
-# Phase 4: zero-copy memoryview over highway slices (see phase spec).
-def _memoryview_method(self, i):
-    return self._core.memoryview(i)
-
-
-Reader.memoryview = _memoryview_method
 
 
 def pack_command(args):

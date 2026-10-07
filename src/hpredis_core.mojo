@@ -89,8 +89,10 @@ struct Reader(Defaultable, Movable, Writable):
     var dec_errors: Int
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
+    # arena as a Python bytearray: views over it keep it alive, and CPython
+    # refuses to resize an exported buffer (see _ensure_cap)
+    var buf_obj: Int
     var highway_slices: List[ResponseSlice]
-    var highway_base: Int
 
     def __init__(out self):
         self.buf_addr = 0
@@ -103,8 +105,8 @@ struct Reader(Defaultable, Movable, Writable):
         self.dec_encoding = 0
         self.dec_errors = 0
         self.needs_scan = False
+        self.buf_obj = 0
         self.highway_slices = List[ResponseSlice]()
-        self.highway_base = 0
 
     # === Python-facing methods ===
 
@@ -121,6 +123,8 @@ struct Reader(Defaultable, Movable, Writable):
             raise Error("feed() expects a buffer-protocol object")
         var n = Int(view.len)
         if n > 0:
+            if _arena_exports(self_ptr[]) > 0:
+                _arena_detach(self_ptr[], self_ptr[].buf_cap)
             _ensure_cap(self_ptr[], self_ptr[].buf_len + n)
             var dst = Pointer[UInt8, MutAnyOrigin](
                 unsafe_from_address=self_ptr[].buf_addr + self_ptr[].buf_len)
@@ -205,9 +209,10 @@ struct Reader(Defaultable, Movable, Writable):
         """Release the arena.  The wrapper calls this from __del__: without it
         every Reader leaks its buffer when it is garbage collected (measured:
         +250MB over 2000 readers fed 64KB each)."""
-        if self_ptr[].buf_addr != 0:
-            _ = external_call["free", NoneType](
-                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr))
+        if self_ptr[].buf_obj != 0:
+            _ = external_call["Py_DecRef", NoneType](
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_obj))
+            self_ptr[].buf_obj = 0
             self_ptr[].buf_addr = 0
             self_ptr[].buf_cap = 0
             self_ptr[].buf_len = 0
@@ -271,48 +276,54 @@ struct Reader(Defaultable, Movable, Writable):
 
     @staticmethod
     def highway_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+        """One call per reply: (status, table, arena).
+
+        status 0: table is n*24 bytes of little-endian int64 triples
+        (offset, length, resp_type) with absolute offsets into arena, and arena
+        is the bytearray holding the reply.  Consumers read payloads with
+        np.frombuffer(arena, offset=..., count=...) / memoryview(arena)[o:o+l]:
+        no per-slice bridge call, and the view owns the buffer.
+        status 1: incomplete -> (1, None, None).
+        status 2: protocol error (sticky, like gets) -> (2, message, None).
+        """
+        ref cpy = Python().cpython()
         if self_ptr[].consumed >= self_ptr[].buf_len:
-            return _tuple3(ST_INCOMPLETE, 0, 0)
+            if self_ptr[].buf_obj == 0:
+                return _hw_tuple(_none_payload(), _none_payload(), _none_payload())
+            return _hw_tuple(cpy.PyLong_FromSsize_t(ST_INCOMPLETE), _none_payload(), _none_payload())
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         var start = self_ptr[].consumed
         self_ptr[].highway_slices.clear()
-        var pos = _scan_highway(ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start)
-        if pos < 0:
-            return _tuple3(ST_INCOMPLETE, 0, 0)
-        self_ptr[].consumed = pos
-        # No compaction on the highway path: memmove would overwrite the
-        # reply we just exposed via memoryviews/pointers.
-        self_ptr[].highway_base = self_ptr[].buf_addr + start
-        return _tuple3(ST_OK, self_ptr[].highway_base, len(self_ptr[].highway_slices))
-
-    @staticmethod
-    def highway_slice(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], i: PythonObject) raises -> PythonObject:
-        var idx = Int(py=i)
-        if idx < 0 or idx >= len(self_ptr[].highway_slices):
-            raise Error("slice index out of range")
-        var s = self_ptr[].highway_slices[idx]
-        ref cpy = Python().cpython()
-        var t = cpy.PyTuple_New(3)
-        _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(self_ptr[].highway_base + s.offset))
-        _ = cpy.PyTuple_SetItem(t, 1, cpy.PyLong_FromSsize_t(s.length))
-        _ = cpy.PyTuple_SetItem(t, 2, cpy.PyLong_FromSsize_t(Int(s.resp_type)))
-        return PythonObject(from_owned=t)
-
-    @staticmethod
-    def memoryview(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], i: PythonObject) raises -> PythonObject:
-        """Zero-copy read-only memoryview over highway slice i (PyBUF_READ)."""
-        var idx = Int(py=i)
-        if idx < 0 or idx >= len(self_ptr[].highway_slices):
-            raise Error("slice index out of range")
-        var s = self_ptr[].highway_slices[idx]
-        if s.length <= 0:
-            raise Error("slice has no data")
-        var obj = external_call["PyMemoryView_FromMemory", PyObjectPtr](
-            Pointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=self_ptr[].highway_base + s.offset),
-            c_ssize_t(s.length),
-            c_int(0x100))  # PyBUF_READ
-        return PythonObject(from_owned=obj)
+        var res = _scan_highway(ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start, 1)
+        if res.status == ST_INCOMPLETE:
+            return _hw_tuple(cpy.PyLong_FromSsize_t(ST_INCOMPLETE), _none_payload(), _none_payload())
+        if res.status == ST_PROTO_ERR:
+            self_ptr[].proto_err = True
+            self_ptr[].proto_err_msg = res.err_msg
+            return _hw_tuple(
+                cpy.PyLong_FromSsize_t(ST_PROTO_ERR), _bytes_payload(res.err_msg), _none_payload())
+        self_ptr[].consumed = res.pos
+        # Bound the arena like the classic path does, but only when no view is
+        # alive: an exported bytearray must not be rewritten under its readers.
+        if self_ptr[].consumed == self_ptr[].buf_len and _arena_exports(self_ptr[]) == 0:
+            self_ptr[].buf_len = 0
+            self_ptr[].consumed = 0
+        var n = len(self_ptr[].highway_slices)
+        var table = _new_arena(n * 24, 0, 0)
+        var tp = _arena_ptr(table)
+        for i in range(n):
+            var s = self_ptr[].highway_slices[i]
+            _write_i64(tp, i * 24, start + s.offset)
+            _write_i64(tp, i * 24 + 8, s.length)
+            _write_i64(tp, i * 24 + 16, Int(s.resp_type))
+        var arena = PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=self_ptr[].buf_obj))
+        _ = cpy.Py_IncRef(arena)
+        return _hw_tuple(
+            cpy.PyLong_FromSsize_t(ST_OK),
+            PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+                unsafe_from_address=table)),
+            arena)
 
     def write_to(self, mut writer: Some[Writer]):
         t"Reader(buffered={self.buf_len - self.consumed})".write_to(writer)
@@ -352,18 +363,89 @@ struct PyBuffer(Defaultable):
 
 # === Arena ===
 
+def _new_arena(size: Int, src: Int, src_len: Int) raises -> Int:
+    """A bytearray of `size` bytes holding a copy of src_len bytes at src.
+
+    PyByteArray_FromStringAndSize(NULL, n) needs a null pointer, which Mojo's
+    non-nullable Pointer cannot express; a zero-length copy followed by
+    PyByteArray_Resize has the same effect and never reads src.
+    """
+    var obj = external_call["PyByteArray_FromStringAndSize", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=src), c_ssize_t(src_len))
+    if Int(obj) == 0:
+        raise Error("out of memory")
+    if size > src_len:
+        var rc = external_call["PyByteArray_Resize", c_int](
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(obj)), c_ssize_t(size))
+        if rc != 0:
+            _ = Python().cpython().PyErr_Clear()
+            raise Error("out of memory")
+    return Int(obj)
+
+
+def _arena_ptr(obj: Int) -> Pointer[UInt8, MutAnyOrigin]:
+    return external_call["PyByteArray_AsString", Pointer[UInt8, MutAnyOrigin]](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=obj))
+
+
+def _arena_exports(r: Reader) -> Int:
+    """Number of live exports (memoryviews / numpy arrays) on the arena.
+
+    Reads ob_exports at offset 48 of PyByteArrayObject: CPython's documented
+    layout (var head 24 bytes, ob_alloc, ob_bytes, ob_start, ob_exports) and
+    unchanged across 3.9-3.13, checked against ctypes on 3.12.  A probe via
+    PyByteArray_Resize cannot be used: a same-size resize is a no-op even when
+    the buffer is exported.
+    """
+    if r.buf_obj == 0:
+        return 0
+    return Int(Pointer[Int, MutAnyOrigin](unsafe_from_address=r.buf_obj + 48)[])
+
+
+def _arena_detach(mut r: Reader, want_cap: Int) raises:
+    """Continue in a fresh arena, copying the pending bytes over.
+
+    Called when a feed meets an exported buffer: a held memoryview/numpy array
+    points into the old bytearray, so reusing that memory (even without a
+    resize question, since the old bytes would be overwritten in place) would
+    silently rewrite its data.  The view keeps the old bytearray alive and
+    parsing continues in the new one.
+    """
+    var pending = r.buf_len - r.consumed
+    var cap = want_cap if want_cap > pending else pending
+    var fresh = _new_arena(cap, r.buf_addr + r.consumed, pending)
+    _ = external_call["Py_DecRef", NoneType](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj))
+    r.buf_obj = fresh
+    r.buf_cap = cap
+    r.buf_len = pending
+    r.consumed = 0
+    r.buf_addr = Int(_arena_ptr(r.buf_obj))
+
+
 def _ensure_cap(mut r: Reader, needed: Int) raises:
     if needed <= r.buf_cap:
         return
     var new_cap = r.buf_cap if r.buf_cap > 0 else 4096
     while new_cap < needed:
         new_cap *= 2
-    var newp = external_call["realloc", Pointer[UInt8, MutAnyOrigin]](
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr), c_size_t(new_cap))
-    if Int(newp) == 0:
-        raise Error("out of memory")
-    r.buf_addr = Int(newp)
+    if r.buf_obj == 0:
+        r.buf_obj = _new_arena(new_cap, r.buf_addr, 0)
+        r.buf_cap = new_cap
+        r.buf_addr = Int(_arena_ptr(r.buf_obj))
+        return
+    if _arena_exports(r) > 0:
+        # a live view pins the old arena: continue in a fresh one
+        _arena_detach(r, new_cap)
+        return
+    var rc = external_call["PyByteArray_Resize", c_int](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj), c_ssize_t(new_cap))
+    if rc != 0:
+        _ = Python().cpython().PyErr_Clear()
+        _arena_detach(r, new_cap)
+        return
     r.buf_cap = new_cap
+    r.buf_addr = Int(_arena_ptr(r.buf_obj))
 
 
 def _compact(mut r: Reader) -> Bool:
@@ -454,6 +536,23 @@ def _tuple3(a: UInt8, b: Int, c: Int) raises -> PythonObject:
     _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(Int(a)))
     _ = cpy.PyTuple_SetItem(t, 1, cpy.PyLong_FromSsize_t(b))
     _ = cpy.PyTuple_SetItem(t, 2, cpy.PyLong_FromSsize_t(c))
+    return PythonObject(from_owned=t)
+
+
+def _write_i64(ptr: Pointer[UInt8, MutAnyOrigin], offset: Int, value: Int):
+    """Little-endian int64 store (numpy '<i8' on the consumer side)."""
+    var v = UInt64(value)
+    for k in range(8):
+        ptr.unsafe_offset(offset + k)[] = UInt8((v >> UInt64(8 * k)) & 0xFF)
+
+
+def _hw_tuple(a: PyObjectPtr, b: PyObjectPtr, c: PyObjectPtr) raises -> PythonObject:
+    """Tuple of three already-owned references (PyTuple_SetItem steals)."""
+    ref cpy = Python().cpython()
+    var t = cpy.PyTuple_New(3)
+    _ = cpy.PyTuple_SetItem(t, 0, a)
+    _ = cpy.PyTuple_SetItem(t, 1, b)
+    _ = cpy.PyTuple_SetItem(t, 2, c)
     return PythonObject(from_owned=t)
 
 
@@ -603,10 +702,17 @@ struct ScanResult(ImplicitlyCopyable):
     """Scan outcome: like Node but without any Python objects."""
     var status: UInt8
     var pos: Int
+    var err_msg: String
 
     def __init__(out self, status: UInt8, pos: Int):
         self.status = status
         self.pos = pos
+        self.err_msg = String()
+
+    def __init__(out self, status: UInt8, pos: Int, err_msg: String):
+        self.status = status
+        self.pos = pos
+        self.err_msg = err_msg
 
 
 def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int) -> ScanResult:
@@ -1074,51 +1180,146 @@ def _payload_str(payload: PythonObject) raises -> String:
 # === Highway scan (leaf slices only) ===
 
 def _scan_highway(
-    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, mut slices: List[ResponseSlice], base: Int
-) -> Int:
-    """Scan one reply; returns end pos, or -1 if incomplete. Proto errors: -2.
-    Slice offsets are recorded relative to `base` (the reply start)."""
+    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int,
+    mut slices: List[ResponseSlice], base: Int, depth: Int,
+) -> ScanResult:
+    """Record one reply's byte slices; create no Python objects.
+
+    Returns ST_OK with the end position, ST_INCOMPLETE, or ST_PROTO_ERR with
+    the same message the classic parser produces (so highway mode never
+    reports a protocol error as "no data yet").  Only byte payloads ('+', '$',
+    '=', '-', ',' and ':' text) become slices; other scalars are validated and
+    skipped.  Slice offsets are relative to `base` (the reply start).
+    """
     if start >= end:
-        return -1
+        return ScanResult(ST_INCOMPLETE, start)
     var t = ptr.unsafe_offset(start)[]
-    if t == TYPE_SIMPLE or t == TYPE_ERROR or t == TYPE_INT:
+    if t == TYPE_SIMPLE or t == TYPE_ERROR or t == TYPE_INT or t == 44:
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
-            return -1
+            return ScanResult(ST_INCOMPLETE, start)
         _record_slice(slices, start + 1 - base, crlf - (start + 1), t)
-        return crlf + 2
+        return ScanResult(ST_OK, crlf + 2)
     if t == TYPE_BULK:
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var blen = _read_int(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
-            return -1
-        if status == ST_PROTO_ERR or blen < -1:
-            return -2
+            return ScanResult(ST_INCOMPLETE, start)
+        if status == ST_PROTO_ERR:
+            return ScanResult(ST_PROTO_ERR, start, String("Bad bulk string length"))
+        if blen < -1:
+            return ScanResult(ST_PROTO_ERR, start, String("Bulk string length out of range"))
         if blen == -1:
-            return after_int
+            return ScanResult(ST_OK, after_int)
         var pstart = after_int
         if pstart + blen + 2 > end:
-            return -1
+            return ScanResult(ST_INCOMPLETE, start)
         _record_slice(slices, pstart - base, blen, TYPE_BULK)
-        return pstart + blen + 2
-    if t == TYPE_ARRAY or t == 62:  # '*' or '>' (push)
+        return ScanResult(ST_OK, pstart + blen + 2)
+    if t == TYPE_ARRAY or t == 62:  # '*' or '>'
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
-            return -1
-        if status == ST_PROTO_ERR or count < -1:
-            return -2
+            return ScanResult(ST_INCOMPLETE, start)
+        if status == ST_PROTO_ERR:
+            return ScanResult(ST_PROTO_ERR, start, String("Bad multi-bulk length"))
+        if count < -1:
+            return ScanResult(ST_PROTO_ERR, start, String("Multi-bulk length out of range"))
         if count == -1:
-            return after_int
+            return ScanResult(ST_OK, after_int)
+        if depth > MAX_DEPTH:
+            return ScanResult(ST_PROTO_ERR, start, String("Max nesting depth exceeded"))
+        if count > (end - after_int) // 3:
+            return ScanResult(ST_INCOMPLETE, start)
         var pos = after_int
-        for _ in range(count):
-            pos = _scan_highway(ptr, pos, end, slices, base)
-            if pos < 0:
-                return -1
-        return pos
-    return -2
+        for _i in range(count):
+            var child = _scan_highway(ptr, pos, end, slices, base, depth + 1)
+            if child.status != ST_OK:
+                return child
+            pos = child.pos
+        return ScanResult(ST_OK, pos)
+    if t == 126:  # '~' set: byte slices only, structure is not exposed
+        var after_int2 = start + 1
+        var status2: UInt8 = ST_OK
+        var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
+        if status2 == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status2 == ST_PROTO_ERR or count2 < 0:
+            return ScanResult(ST_PROTO_ERR, start, String("Bad set length"))
+        if depth > MAX_DEPTH:
+            return ScanResult(ST_PROTO_ERR, start, String("Max nesting depth exceeded"))
+        if count2 > (end - after_int2) // 3:
+            return ScanResult(ST_INCOMPLETE, start)
+        var spos = after_int2
+        for _i2 in range(count2):
+            var child2 = _scan_highway(ptr, spos, end, slices, base, depth + 1)
+            if child2.status != ST_OK:
+                return child2
+            spos = child2.pos
+        return ScanResult(ST_OK, spos)
+    if t == 37:  # '%' map: key and value slices, pairs flattened
+        var after_int3 = start + 1
+        var status3: UInt8 = ST_OK
+        var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
+        if status3 == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status3 == ST_PROTO_ERR or pairs < 0:
+            return ScanResult(ST_PROTO_ERR, start, String("Bad map length"))
+        if depth > MAX_DEPTH:
+            return ScanResult(ST_PROTO_ERR, start, String("Max nesting depth exceeded"))
+        if pairs > (end - after_int3) // 6:
+            return ScanResult(ST_INCOMPLETE, start)
+        var mpos = after_int3
+        for _i3 in range(pairs):
+            var key_node = _scan_highway(ptr, mpos, end, slices, base, depth + 1)
+            if key_node.status != ST_OK:
+                return key_node
+            mpos = key_node.pos
+            var val_node = _scan_highway(ptr, mpos, end, slices, base, depth + 1)
+            if val_node.status != ST_OK:
+                return val_node
+            mpos = val_node.pos
+        return ScanResult(ST_OK, mpos)
+    if t == 61:  # '=' verbatim: skip the "txt:" prefix like the classic path
+        var after_int4 = start + 1
+        var status4: UInt8 = ST_OK
+        var vlen = _read_int(ptr, start + 1, end, after_int4, status4)
+        if status4 == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status4 == ST_PROTO_ERR or vlen < 0:
+            return ScanResult(ST_PROTO_ERR, start, String("Bad verbatim string length"))
+        var pstart4 = after_int4
+        if pstart4 + vlen + 2 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        var colon = _find_byte(ptr, pstart4, pstart4 + vlen, 58)
+        var vpos = pstart4 + vlen
+        var vlen2 = vlen
+        if colon >= 0:
+            vpos = colon + 1
+            vlen2 = pstart4 + vlen - vpos
+        _record_slice(slices, vpos - base, vlen2, t)
+        return ScanResult(ST_OK, pstart4 + vlen + 2)
+    if t == 35:  # '#' bool
+        if start + 4 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        var bval = ptr.unsafe_offset(start + 1)[]
+        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
+            return ScanResult(ST_PROTO_ERR, start, String("Protocol error: invalid bool reply"))
+        if bval != 116 and bval != 102:
+            return ScanResult(ST_PROTO_ERR, start, String("Protocol error: invalid bool reply"))
+        return ScanResult(ST_OK, start + 4)
+    if t == 95:  # '_' null
+        if start + 3 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
+            return ScanResult(ST_PROTO_ERR, start, String("Protocol error: invalid null reply"))
+        return ScanResult(ST_OK, start + 3)
+    var msg = String("Protocol error, got ")
+    msg += _hex_byte(Int(t))
+    msg += " as reply type byte"
+    return ScanResult(ST_PROTO_ERR, start, msg)
 
 
 def _record_slice(mut slices: List[ResponseSlice], offset: Int, length: Int, resp_type: UInt8):
@@ -1144,9 +1345,7 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_method[Reader.clear_decoding]("clear_decoding") \
             .def_method[Reader.drain]("drain") \
             .def_method[Reader.buffered]("buffered") \
-            .def_method[Reader.highway_gets]("highway_gets") \
-            .def_method[Reader.highway_slice]("highway_slice") \
-            .def_method[Reader.memoryview]("memoryview")
+            .def_method[Reader.highway_gets]("highway_gets")
         return m.finalize()
     except e:
         abort(String("error creating hpredis_core:", e))

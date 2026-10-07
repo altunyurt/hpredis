@@ -12,12 +12,12 @@ r = hpredis.Reader()
 r.feed(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
 assert r.gets() == [b"hello", b"world"]
 
-# highway: zero-copy pointers -> memoryview -> NumPy (no per-byte copies)
+# highway: one call gives an offsets table plus the buffer it points into
 h = hpredis.Reader(highway_mode=True)
 h.feed(b"$6144\r\n" + vector_bytes + b"\r\n")
-addr, count = h.gets()
-mv = h.memoryview(0)
-arr = np.frombuffer(mv, dtype=np.float32)   # shares memory, ~1.4 µs
+table, arena = h.gets()                     # n*24 bytes: (offset, length, type)
+off, length, resp_type = struct.unpack_from("<qqq", table, 0)
+arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 ```
 
 ## Features
@@ -29,8 +29,9 @@ arr = np.frombuffer(mv, dtype=np.float32)   # shares memory, ~1.4 µs
   oracle
 - redis-py 8.1 integration tested end-to-end (ping/get/set/hset/incr/lrange/
   pipelines, `decode_responses`, `CLIENT SETINFO`, fragmented recv)
-- Highway mode: read-only zero-copy `memoryview`s over the parser arena,
-  directly consumable by NumPy/PyTorch/JAX via the buffer protocol
+- Highway mode: one call returns an offsets table plus the `bytearray` it
+  points into, so NumPy/PyTorch/JAX read payloads without a copy and without a
+  per-slice call; views own their bytes (valid across later feeds)
 - Zero Python-heap traffic on feed+parse; allocations constant regardless of
   payload size
 
@@ -65,7 +66,7 @@ deep-50          96.8 MB/s    14.7     127.2
 Python bytes ──feed──► Mojo arena (malloc/realloc, C-heap only)
                           │  RESP scanner (memchr CRLF search)
                           ├─► classic: CPython C-API objects (list/bytes/int)
-                          └─► highway: (addr, count) + memoryview slices
+                          └─► highway: (offsets table, arena) for native reads
 ```
 
 Five TDD phases, each with spec + tests + self-contained output
@@ -78,6 +79,7 @@ built from the phase-4 output by `dev/phase/05/output/build_release.sh`.
 - Classic mode is 0.15–0.45× hiredis-py throughput (advisory, unoptimized v1)
 - RESP3 types (maps, push notifications, `pack_command`) not yet supported;
   RESP2 covers the redis-py default paths
-- Highway memoryviews borrow the arena: valid until the next `feed()`
-  that grows/moves that reply's bytes
+- Highway mode keeps the arena alive while a view is held (a feed moves to a
+  fresh buffer rather than overwriting visible bytes); releasing views lets the
+  next feed rewind it
 - Protocol-error messages match hiredis byte-for-byte, including escapes

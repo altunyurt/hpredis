@@ -22,12 +22,12 @@ r = hpredis.Reader()
 r.feed(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
 assert r.gets() == [b"hello", b"world"]
 
-# highway: zero-copy pointers -> memoryview -> NumPy (no per-byte copies)
+# highway: one call gives an offsets table plus the buffer it points into
 h = hpredis.Reader(highway_mode=True)
 h.feed(b"$6144\r\n" + vector_bytes + b"\r\n")
-addr, count = h.gets()
-mv = h.memoryview(0)
-arr = np.frombuffer(mv, dtype=np.float32)   # shares memory, ~1.4 µs
+table, arena = h.gets()                     # n*24 bytes: (offset, length, type)
+off, length, resp_type = struct.unpack_from("<qqq", table, 0)
+arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 ```
 
 ## Features
@@ -75,7 +75,7 @@ deep-50          96.8 MB/s    14.7     127.2
 Python bytes ──feed──► Mojo arena (malloc/realloc, C-heap only)
                           │  RESP scanner (memchr CRLF search)
                           ├─► classic: CPython C-API objects (list/bytes/int)
-                          └─► highway: (addr, count) + memoryview slices
+                          └─► highway: (offsets table, arena) for native reads
 ```
 
 Five TDD phases, each with spec + tests + self-contained output
