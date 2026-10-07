@@ -25,6 +25,7 @@ hpredis = ["*.so"]
 
 [dependency-groups]
 dev = [
+    "fakeredis>=2.39.0",
     "hiredis>=3.4.2",
     "ipython>=9.17.1",
     "mojo>=1.1.0",

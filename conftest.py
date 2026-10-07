@@ -43,3 +43,23 @@ def build_module(phase_dir: Path, src_name: str, so_name: str) -> Path:
         env=mojo_env(),
     )
     return so
+
+
+def ensure_release_bundle() -> None:
+    """Build src/hpredis (release bundle) if missing: src/tests/ imports it."""
+    root = Path(__file__).parent
+    so = root / "src" / "hpredis" / "hpredis_core.so"
+    if so.exists():
+        return
+    subprocess.run(
+        [str(root / "dev/phase/05/output/build_release.sh")],
+        check=True,
+        capture_output=True,
+        env=mojo_env(),
+    )
+
+
+def pytest_configure(config):
+    """src/tests/ (adapted hiredis suite) imports the release bundle.
+    Runs before collection, so the import resolves."""
+    ensure_release_bundle()

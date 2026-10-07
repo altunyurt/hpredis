@@ -1,0 +1,155 @@
+F
+=================================== FAILURES ===================================
+______________________________ test_redis_py_ping ______________________________
+
+self = <redis.connection.ConnectionPool(<test_phase3.FakeConn(protocol=2,decode_responses=False)>)>
+command_name = None, keys = (), options = {}
+
+    @deprecated_args(
+        args_to_warn=["*"],
+        reason="Use get_connection() without args instead",
+        version="5.3.0",
+    )
+    def get_connection(self, command_name=None, *keys, **options) -> "Connection":
+        "Get a connection from the pool"
+    
+        # Start timing for observability
+        self._checkpid()
+        is_created = False
+    
+        with self._lock:
+            try:
+                connection = self._available_connections.pop()
+            except IndexError:
+                # Start timing for observability
+                start_time_created = time.monotonic()
+    
+                connection = self.make_connection()
+                is_created = True
+            self._in_use_connections.add(connection)
+    
+        # Record state transition: IDLE -> USED
+        # (make_connection already recorded IDLE +1 for new connections)
+        # This ensures counters stay balanced if connect() fails and release() is called
+        pool_name = get_pool_name(self)
+        record_connection_count(
+            pool_name=pool_name,
+            connection_state=ConnectionState.IDLE,
+            counter=-1,
+        )
+        record_connection_count(
+            pool_name=pool_name,
+            connection_state=ConnectionState.USED,
+            counter=1,
+        )
+    
+        try:
+            # ensure this connection is connected to Redis
+            connection.connect()
+            # connections that the pool provides should be ready to send
+            # a command. if not, the connection was either returned to the
+            # pool before all data has been read or the socket has been
+            # closed. either way, reconnect and verify everything is good.
+            try:
+                if (
+>                   connection.can_read()
+                    and self.cache is None
+                    and not self.maint_notifications_enabled()
+                ):
+
+.venv/lib/python3.12/site-packages/redis/connection.py:3280: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.12/site-packages/redis/connection.py:1387: in can_read
+    return self._parser.can_read(timeout)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <redis._parsers.hiredis._HiredisParser object at 0x7f5f14230b60>
+timeout = 0
+
+    def can_read(self, timeout: float = 0) -> bool:
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
+        if not self._reader:
+>           raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+E           redis.exceptions.ConnectionError: Connection closed by server.
+
+.venv/lib/python3.12/site-packages/redis/_parsers/hiredis.py:163: ConnectionError
+
+During handling of the above exception, another exception occurred:
+
+redis_env = (<test_phase3.Holder object at 0x7f5f1420f140>, <class 'test_phase3.redis_env.<locals>.FakeConn'>)
+
+    def test_redis_py_ping(redis_env):
+        holder, FakeConn = redis_env
+        holder.responses = SETINFO + [b"+PONG\r\n"]
+        client = _client(FakeConn)
+>       assert client.ping() is True
+               ^^^^^^^^^^^^^
+
+dev/phase/03/test_phase3.py:301: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.12/site-packages/redis/commands/core.py:2037: in ping
+    return self.execute_command("PING", **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/redis/client.py:867: in execute_command
+    return self._execute_command(*args, **options)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/redis/client.py:873: in _execute_command
+    conn = self.connection or pool.get_connection()
+                              ^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/redis/utils.py:258: in wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.12/site-packages/redis/connection.py:3287: in get_connection
+    connection.connect()
+.venv/lib/python3.12/site-packages/redis/connection.py:1028: in connect
+    self.retry.call_with_retry(
+.venv/lib/python3.12/site-packages/redis/retry.py:132: in call_with_retry
+    raise error
+.venv/lib/python3.12/site-packages/redis/retry.py:120: in call_with_retry
+    return do()
+           ^^^^
+.venv/lib/python3.12/site-packages/redis/connection.py:1029: in <lambda>
+    lambda: self.connect_check_health(
+.venv/lib/python3.12/site-packages/redis/connection.py:1083: in connect_check_health
+    self.on_connect_check_health(check_health=check_health)
+.venv/lib/python3.12/site-packages/redis/connection.py:1232: in on_connect_check_health
+    self.read_response()
+.venv/lib/python3.12/site-packages/redis/connection.py:1413: in read_response
+    response = self._parser.read_response(
+.venv/lib/python3.12/site-packages/redis/_parsers/hiredis.py:238: in read_response
+    self.read_from_socket(timeout=timeout)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <redis._parsers.hiredis._HiredisParser object at 0x7f5f14230b60>
+timeout = <object object at 0x7f5f15221980>, raise_on_timeout = True
+
+    def read_from_socket(self, timeout=SENTINEL, raise_on_timeout=True):
+        sock = self._sock
+        reader = self._reader
+        # Another thread may disconnect this connection while we are here (e.g.
+        # a shared client closed via `with redis:`); on_disconnect() sets both
+        # _sock and _reader to None. Bind them locally and fail with a
+        # descriptive, retryable ConnectionError instead of an AttributeError.
+        if sock is None or reader is None:
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+        custom_timeout = timeout is not SENTINEL
+        try:
+            if custom_timeout:
+                sock.settimeout(timeout)
+            bufflen = sock.recv_into(self._buffer)
+            if bufflen == 0:
+>               raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+E               redis.exceptions.ConnectionError: Connection closed by server.
+
+.venv/lib/python3.12/site-packages/redis/_parsers/hiredis.py:194: ConnectionError
+=============================== warnings summary ===============================
+dev/phase/03/test_phase3.py::test_redis_py_ping
+  <frozen importlib._bootstrap>:488: DeprecationWarning: builtin type Reader has no __module__ attribute
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED dev/phase/03/test_phase3.py::test_redis_py_ping - redis.exceptions.Con...
+!!!!!!!!!!!!!!!!!!!!!!!!!! stopping after 1 failures !!!!!!!!!!!!!!!!!!!!!!!!!!!
+1 failed, 1 warning in 2.01s

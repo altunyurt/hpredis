@@ -23,6 +23,8 @@ comptime ST_OK = 0
 comptime ST_INCOMPLETE = 1
 comptime ST_PROTO_ERR = 2
 comptime ST_REPLY_ERR = 3
+comptime ST_PUSH = 4
+comptime ST_DICT_ERR = 5
 
 # nested error marker sentinel (tuple[0]); unique, never valid RESP data
 comptime ERR_SENTINEL = "\x00hpredis-error\x00"
@@ -117,15 +119,19 @@ struct Reader(Defaultable, Movable, Writable):
         var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len)
         if node.status == ST_INCOMPLETE:
             return _status_tuple(ST_INCOMPLETE, _none_payload())
-        if node.status == ST_OK:
+        if node.status == ST_OK or node.status == ST_PUSH:
             self_ptr[].consumed = node.pos
             _ = _compact(self_ptr[])
-            return _status_tuple(ST_OK, node.payload.steal_data())
+            return _status_tuple(node.status, node.payload.steal_data())
         if node.status == ST_REPLY_ERR:
             # consumed (matches hiredis); wrapper builds the replyError instance
             self_ptr[].consumed = node.pos
             _ = _compact(self_ptr[])
             return _status_tuple(ST_REPLY_ERR, node.payload.steal_data())
+        if node.status == ST_DICT_ERR:
+            self_ptr[].consumed = node.pos
+            _ = _compact(self_ptr[])
+            return _status_tuple(ST_DICT_ERR, node.payload.steal_data())
         # protocol error: sticky, not consumed
         self_ptr[].proto_err = True
         self_ptr[].proto_err_msg = node.err_msg
@@ -426,7 +432,7 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
         # hiredis does not validate the trailing CRLF after a bulk payload;
         # it consumes payload + 2 bytes unconditionally (verified 3.4.2)
         return Node(ST_OK, pstart + blen + 2, PythonObject(from_owned=_bytes_slice_payload(ptr, pstart, blen)))
-    if t == TYPE_ARRAY:
+    if t == TYPE_ARRAY or t == 62:  # '*' or '>' (push)
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
@@ -449,11 +455,164 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
                 return _proto_node(start, child.err_msg)
             _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
             pos = child.pos
-        return Node(ST_OK, pos, PythonObject(from_owned=list_obj))
+        var out_status: UInt8 = ST_PUSH if t == 62 else ST_OK
+        return Node(out_status, pos, PythonObject(from_owned=list_obj))
+    if t == 44:  # ',' double
+        var crlf = _find_crlf(ptr, start + 1, end)
+        if crlf < 0:
+            return _incomplete_node(start)
+        # strtod-exact: let CPython parse the text (float(pybytes))
+        var text = PythonObject(from_owned=_bytes_slice_payload(ptr, start + 1, crlf - (start + 1)))
+        var f = Float64(py=Python.float(text))
+        return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(f)))
+    if t == 35:  # '#' bool: #t\r\n / #f\r\n
+        if start + 4 > end:
+            return _incomplete_node(start)
+        var bval = ptr.unsafe_offset(start + 1)[]
+        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
+            return _proto_node(start, "Protocol error: invalid bool reply")
+        ref cpy2 = Python().cpython()
+        if bval == 116:
+            return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(1)))
+        if bval == 102:
+            return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(0)))
+        return _proto_node(start, "Protocol error: invalid bool reply")
+    if t == 95:  # '_' null
+        if start + 3 > end:
+            return _incomplete_node(start)
+        if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
+            return _proto_node(start, "Protocol error: invalid null reply")
+        return Node(ST_OK, start + 3, PythonObject(from_owned=_none_payload()))
+    if t == 61:  # '=' verbatim string
+        var after_int = start + 1
+        var status: UInt8 = ST_OK
+        var vlen = _read_int(ptr, start + 1, end, after_int, status)
+        if status == ST_INCOMPLETE:
+            return _incomplete_node(start)
+        if status == ST_PROTO_ERR or vlen < 0:
+            return _proto_node(start, "Bad verbatim string length")
+        var pstart = after_int
+        if pstart + vlen + 2 > end:
+            return _incomplete_node(start)
+        var colon = _find_byte(ptr, pstart, pstart + vlen, 58)
+        var vpos = pstart + vlen
+        var vlen2 = vlen
+        if colon >= 0:
+            vpos = colon + 1
+            vlen2 = pstart + vlen - vpos
+        return Node(ST_OK, pstart + vlen + 2, PythonObject(from_owned=_bytes_slice_payload(ptr, vpos, vlen2)))
+    if t == 126:  # '~' set -> plain list (hiredis-py parity)
+        var after_int2 = start + 1
+        var status2: UInt8 = ST_OK
+        var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
+        if status2 == ST_INCOMPLETE:
+            return _incomplete_node(start)
+        if status2 == ST_PROTO_ERR or count2 < 0:
+            return _proto_node(start, "Bad set length")
+        ref cpy3 = Python().cpython()
+        var set_list = cpy3.PyList_New(count2)
+        var spos = after_int2
+        for i2 in range(count2):
+            var child2 = _parse_node(ptr, spos, end)
+            if child2.status == ST_INCOMPLETE:
+                return _incomplete_node(start)
+            if child2.status == ST_PROTO_ERR:
+                return _proto_node(start, child2.err_msg)
+            _ = cpy3.PyList_SetItem(set_list, i2, child2.payload.steal_data())
+            spos = child2.pos
+        return Node(ST_OK, spos, PythonObject(from_owned=set_list))
+    if t == 37:  # '%' map -> dict (N key/value pairs)
+        var after_int3 = start + 1
+        var status3: UInt8 = ST_OK
+        var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
+        if status3 == ST_INCOMPLETE:
+            return _incomplete_node(start)
+        if status3 == ST_PROTO_ERR or pairs < 0:
+            return _proto_node(start, "Bad map length")
+        ref cpy4 = Python().cpython()
+        var dict_obj = cpy4.PyDict_New()
+        var mpos = after_int3
+        for i3 in range(pairs):
+            var key_node = _parse_node(ptr, mpos, end)
+            if key_node.status == ST_INCOMPLETE:
+                return _incomplete_node(start)
+            if key_node.status == ST_PROTO_ERR:
+                return _proto_node(start, key_node.err_msg)
+            mpos = key_node.pos
+            var val_node = _parse_node(ptr, mpos, end)
+            if val_node.status == ST_INCOMPLETE:
+                return _incomplete_node(start)
+            if val_node.status == ST_PROTO_ERR:
+                return _proto_node(start, val_node.err_msg)
+            mpos = val_node.pos
+            var rc = cpy4.PyDict_SetItem(
+                dict_obj, key_node.payload.steal_data(), val_node.payload.steal_data())
+            if rc != 0:
+                # unhashable key etc: clear the CPython error, signal the wrapper
+                cpy4.PyErr_Clear()
+                return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=cpy4.Py_None()))
+        return Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
     var msg = String("Protocol error, got ")
     msg += _hex_byte(Int(t))
     msg += " as reply type byte"
     return _proto_node(start, msg)
+
+
+def _find_byte(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, byte: UInt8) -> Int:
+    var hit = external_call["memchr", Pointer[UInt8, MutAnyOrigin]](
+        ptr.unsafe_offset(start), c_int(Int(byte)), c_size_t(end - start))
+    if Int(hit) == 0:
+        return -1
+    return Int(hit) - Int(ptr)
+
+
+def _parse_float(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises -> Float64:
+    """strtod-lite: sign, digits, optional fraction, optional exponent."""
+    var i = start
+    var neg = False
+    if i < end and ptr.unsafe_offset(i)[] == 45:
+        neg = True
+        i += 1
+    elif i < end and ptr.unsafe_offset(i)[] == 43:
+        i += 1
+    var value = 0.0
+    while i < end:
+        var c = Int(ptr.unsafe_offset(i)[])
+        if not (48 <= c <= 57):
+            break
+        value = value * 10.0 + Float64(c - 48)
+        i += 1
+    if i < end and ptr.unsafe_offset(i)[] == 46:  # '.'
+        i += 1
+        var frac = 0.1
+        while i < end:
+            var c2 = Int(ptr.unsafe_offset(i)[])
+            if not (48 <= c2 <= 57):
+                break
+            value += Float64(c2 - 48) * frac
+            frac *= 0.1
+            i += 1
+    if i < end and (ptr.unsafe_offset(i)[] == 101 or ptr.unsafe_offset(i)[] == 69):  # e/E
+        i += 1
+        var eneg = False
+        if i < end and ptr.unsafe_offset(i)[] == 45:
+            eneg = True
+            i += 1
+        elif i < end and ptr.unsafe_offset(i)[] == 43:
+            i += 1
+        var exp = 0
+        while i < end:
+            var c3 = Int(ptr.unsafe_offset(i)[])
+            if not (48 <= c3 <= 57):
+                break
+            exp = exp * 10 + c3 - 48
+            i += 1
+        if eneg:
+            exp = -exp
+        value = value * pow(10.0, exp)
+    if i != end:
+        raise Error("invalid RESP float")
+    return -value if neg else value
 
 
 def _hex_byte(b: Int) -> String:
@@ -520,7 +679,7 @@ def _scan_highway(
             return -1
         _record_slice(slices, pstart - base, blen, TYPE_BULK)
         return pstart + blen + 2
-    if t == TYPE_ARRAY:
+    if t == TYPE_ARRAY or t == 62:  # '*' or '>' (push)
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
