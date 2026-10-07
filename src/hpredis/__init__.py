@@ -91,6 +91,28 @@ class Reader:
             raise TypeError("unhashable type in map reply")
         return self._finalize(payload, should_decode)
 
+    def drain(self, should_decode=True):
+        """Parse every complete reply already buffered and return them as a
+        list, in one core call.  A `while r.gets() is not False: ...` loop
+        pays the Mojo<->CPython boundary per reply; drain pays it once.
+
+        Stops at an incomplete tail, which stays buffered for the next feed.
+        A malformed reply raises protocolError and is sticky, as with gets().
+        Not available in highway mode (drain may compact the shared buffer).
+        """
+        if self._highway:
+            raise RuntimeError("drain() is not available in highway mode")
+        replies, proto_msg, dict_err, had_markers = self._core.drain()
+        if dict_err:
+            raise TypeError("unhashable type in map reply")
+        if proto_msg is not None:
+            raise self._protocolError(self._decode_msg(proto_msg, should_decode))
+        if had_markers or (self._encoding is not None and should_decode):
+            # only now does per-reply Python work (error instances, decoding)
+            # pay off; the common path returns the core's list untouched
+            replies = [self._finalize(r, should_decode) for r in replies]
+        return replies
+
     def _highway_gets(self):
         status, addr, count = self._core.highway_gets()
         if status == 1:

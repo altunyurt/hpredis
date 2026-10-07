@@ -52,18 +52,23 @@ struct Node(Movable):
     var pos: Int
     var payload: PythonObject
     var err_msg: String
+    # True when the node or any nested node is an error reply (marker tuple);
+    # drain() uses it to skip per-reply Python finalization for clean batches
+    var had_err: Bool
 
     def __init__(out self, status: UInt8, pos: Int, payload: PythonObject):
         self.status = status
         self.pos = pos
         self.payload = payload
         self.err_msg = String()
+        self.had_err = False
 
     def __init__(out self, status: UInt8, pos: Int, payload: PythonObject, err_msg: String):
         self.status = status
         self.pos = pos
         self.payload = payload
         self.err_msg = err_msg
+        self.had_err = False
 
 
 struct Reader(Defaultable, Movable, Writable):
@@ -136,6 +141,45 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].proto_err = True
         self_ptr[].proto_err_msg = node.err_msg
         return _status_tuple(ST_PROTO_ERR, node.payload.steal_data())
+
+    @staticmethod
+    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+        """Parse every complete reply currently buffered, into one list.
+
+        Returns (replies, proto_msg, dict_err, had_markers); see the wrapper's
+        drain() for the contract.
+        """
+        var collected = List[PyObjectPtr]()
+        if self_ptr[].proto_err:
+            return _drain_result(
+                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), False, False)
+        if self_ptr[].consumed < self_ptr[].buf_len:
+            var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
+            var had_markers = False
+            while True:
+                var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len)
+                if node.status == ST_INCOMPLETE:
+                    break
+                if node.status == ST_DICT_ERR:
+                    # unhashable map key: consumed; the wrapper raises TypeError
+                    self_ptr[].consumed = node.pos
+                    _ = _compact(self_ptr[])
+                    return _drain_result(_list_of(collected), _none_payload(), True, True)
+                if node.status == ST_PROTO_ERR:
+                    # sticky and not consumed (matches gets)
+                    self_ptr[].proto_err = True
+                    self_ptr[].proto_err_msg = node.err_msg
+                    _ = _compact(self_ptr[])
+                    return _drain_result(
+                        _list_of(collected), _bytes_payload(node.err_msg), False, False)
+                if node.had_err:
+                    had_markers = True
+                self_ptr[].consumed = node.pos
+                collected.append(node.payload.steal_data())
+            # compact once for the whole batch (gets compacts per reply)
+            _ = _compact(self_ptr[])
+            return _drain_result(_list_of(collected), _none_payload(), False, had_markers)
+        return _drain_result(_list_of(collected), _none_payload(), False, False)
 
     @staticmethod
     def buffered(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
@@ -291,6 +335,32 @@ def _tuple3(a: UInt8, b: Int, c: Int) raises -> PythonObject:
     return PythonObject(from_owned=t)
 
 
+def _drain_result(
+    replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_err: Bool, had_markers: Bool
+) raises -> PythonObject:
+    ref cpy = Python().cpython()
+    var t = cpy.PyTuple_New(4)
+    _ = cpy.PyTuple_SetItem(t, 0, replies)
+    _ = cpy.PyTuple_SetItem(t, 1, proto_msg)
+    _ = cpy.PyTuple_SetItem(t, 2, cpy.PyBool_FromLong(1) if dict_err else cpy.PyBool_FromLong(0))
+    _ = cpy.PyTuple_SetItem(t, 3, cpy.PyBool_FromLong(1) if had_markers else cpy.PyBool_FromLong(0))
+    return PythonObject(from_owned=t)
+
+
+def _list_of(imm collected: List[PyObjectPtr]) raises -> PyObjectPtr:
+    """Python list from collected stolen refs (PyList_SetItem steals them).
+
+    Building it in one shot beats PyList_Append per reply: the bound
+    PyList_SetItem is cheap, while external_call marshalling per reply costs
+    ~0.3ns per payload byte (measured).
+    """
+    ref cpy = Python().cpython()
+    var lst = cpy.PyList_New(len(collected))
+    for i in range(len(collected)):
+        _ = cpy.PyList_SetItem(lst, i, collected[i])
+    return lst
+
+
 def _error_marker(msg_ptr: Pointer[UInt8, MutAnyOrigin], length: Int) raises -> PyObjectPtr:
     """Nested error reply → (sentinel_bytes, message_bytes)."""
     ref cpy = Python().cpython()
@@ -412,7 +482,9 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
             return Node(ST_OK, after_crlf, PythonObject(from_owned=cpy.PyLong_FromSsize_t(value)))
         var payload = _bytes_slice_payload(ptr, pstart, plen)
         if t == TYPE_ERROR:
-            return Node(ST_REPLY_ERR, crlf + 2, PythonObject(from_owned=_error_marker(ptr.unsafe_offset(pstart), plen)))
+            var err_node = Node(ST_REPLY_ERR, crlf + 2, PythonObject(from_owned=_error_marker(ptr.unsafe_offset(pstart), plen)))
+            err_node.had_err = True
+            return err_node^
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=payload))
     if t == TYPE_BULK:
         var after_int = start + 1
@@ -447,16 +519,21 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
         ref cpy = Python().cpython()
         var list_obj = cpy.PyList_New(count)
         var pos = after_int
+        var saw_err = False
         for i in range(count):
             var child = _parse_node(ptr, pos, end)
             if child.status == ST_INCOMPLETE:
                 return _incomplete_node(start)
             if child.status == ST_PROTO_ERR:
                 return _proto_node(start, child.err_msg)
+            if child.had_err:
+                saw_err = True
             _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
             pos = child.pos
         var out_status: UInt8 = ST_PUSH if t == 62 else ST_OK
-        return Node(out_status, pos, PythonObject(from_owned=list_obj))
+        var out_node = Node(out_status, pos, PythonObject(from_owned=list_obj))
+        out_node.had_err = saw_err
+        return out_node^
     if t == 44:  # ',' double
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
@@ -512,15 +589,20 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
         ref cpy3 = Python().cpython()
         var set_list = cpy3.PyList_New(count2)
         var spos = after_int2
+        var saw_err2 = False
         for i2 in range(count2):
             var child2 = _parse_node(ptr, spos, end)
             if child2.status == ST_INCOMPLETE:
                 return _incomplete_node(start)
             if child2.status == ST_PROTO_ERR:
                 return _proto_node(start, child2.err_msg)
+            if child2.had_err:
+                saw_err2 = True
             _ = cpy3.PyList_SetItem(set_list, i2, child2.payload.steal_data())
             spos = child2.pos
-        return Node(ST_OK, spos, PythonObject(from_owned=set_list))
+        var set_node = Node(ST_OK, spos, PythonObject(from_owned=set_list))
+        set_node.had_err = saw_err2
+        return set_node^
     if t == 37:  # '%' map -> dict (N key/value pairs)
         var after_int3 = start + 1
         var status3: UInt8 = ST_OK
@@ -532,18 +614,23 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
         ref cpy4 = Python().cpython()
         var dict_obj = cpy4.PyDict_New()
         var mpos = after_int3
+        var saw_err3 = False
         for i3 in range(pairs):
             var key_node = _parse_node(ptr, mpos, end)
             if key_node.status == ST_INCOMPLETE:
                 return _incomplete_node(start)
             if key_node.status == ST_PROTO_ERR:
                 return _proto_node(start, key_node.err_msg)
+            if key_node.had_err:
+                saw_err3 = True
             mpos = key_node.pos
             var val_node = _parse_node(ptr, mpos, end)
             if val_node.status == ST_INCOMPLETE:
                 return _incomplete_node(start)
             if val_node.status == ST_PROTO_ERR:
                 return _proto_node(start, val_node.err_msg)
+            if val_node.had_err:
+                saw_err3 = True
             mpos = val_node.pos
             var rc = cpy4.PyDict_SetItem(
                 dict_obj, key_node.payload.steal_data(), val_node.payload.steal_data())
@@ -551,7 +638,9 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
                 # unhashable key etc: clear the CPython error, signal the wrapper
                 cpy4.PyErr_Clear()
                 return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=cpy4.Py_None()))
-        return Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
+        var map_node = Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
+        map_node.had_err = saw_err3
+        return map_node^
     var msg = String("Protocol error, got ")
     msg += _hex_byte(Int(t))
     msg += " as reply type byte"
@@ -716,6 +805,7 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_init_defaultable[Reader]() \
             .def_method[Reader.feed]("feed") \
             .def_method[Reader.try_gets]("try_gets") \
+            .def_method[Reader.drain]("drain") \
             .def_method[Reader.buffered]("buffered") \
             .def_method[Reader.highway_gets]("highway_gets") \
             .def_method[Reader.highway_slice]("highway_slice") \
