@@ -5,6 +5,8 @@ Summary: Add your description here
 Author-email: Özgür Altunyurt <altunyurt@gmail.com>
 Requires-Python: >=3.12
 Description-Content-Type: text/markdown
+License-File: LICENSE
+Dynamic: license-file
 
 # hpredis — a Mojo drop-in replacement for hiredis-py
 

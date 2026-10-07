@@ -69,7 +69,10 @@ class Reader:
                 raise ValueError("invalid length")
             if start + stop > n:
                 raise ValueError("invalid length")
-            data = memoryview(data)[start : start + stop]
+            if not (start == 0 and stop == n):
+                # whole-buffer feeds (redis-py: feed(buf, 0, n)) skip the
+                # memoryview objects entirely
+                data = memoryview(data)[start : start + stop]
         self._core.feed(data)
 
     def gets(self, should_decode=True):
@@ -79,17 +82,25 @@ class Reader:
         if self._highway:
             return self._highway_gets()
         status, payload = self._core.try_gets()
+        if status == 0:
+            # clean reply, no nested error markers: the only Python-side work
+            # that can ever be needed is decoding
+            if self._encoding is not None and should_decode:
+                return self._finalize(payload, should_decode)
+            return payload
         if status == 1:
             return self._notEnoughData
+        if status == 6:
+            # error markers inside the reply: _finalize builds replyError
+            # instances (and decodes)
+            return self._finalize(payload, should_decode)
         if status == 2:
             raise self._protocolError(self._decode_msg(payload, should_decode))
         if status == 3:
             return self._replyError(self._decode_msg(payload[1], should_decode))
         if status == 4:
             return PushNotification(payload)
-        if status == 5:
-            raise TypeError("unhashable type in map reply")
-        return self._finalize(payload, should_decode)
+        raise TypeError("unhashable type in map reply")  # status 5
 
     def drain(self, should_decode=True):
         """Parse every complete reply already buffered and return them as a

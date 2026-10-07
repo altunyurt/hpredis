@@ -25,6 +25,9 @@ comptime ST_PROTO_ERR = 2
 comptime ST_REPLY_ERR = 3
 comptime ST_PUSH = 4
 comptime ST_DICT_ERR = 5
+# clean reply that contains nested error markers: the wrapper must run
+# _finalize to build replyError instances
+comptime ST_OK_MARKERS = 6
 
 # nested error marker sentinel (tuple[0]); unique, never valid RESP data
 comptime ERR_SENTINEL = "\x00hpredis-error\x00"
@@ -127,7 +130,10 @@ struct Reader(Defaultable, Movable, Writable):
         if node.status == ST_OK or node.status == ST_PUSH:
             self_ptr[].consumed = node.pos
             _ = _compact(self_ptr[])
-            return _status_tuple(node.status, node.payload.steal_data())
+            var st = node.status
+            if node.status == ST_OK and node.had_err:
+                st = ST_OK_MARKERS
+            return _status_tuple(st, node.payload.steal_data())
         if node.status == ST_REPLY_ERR:
             # consumed (matches hiredis); wrapper builds the replyError instance
             self_ptr[].consumed = node.pos
