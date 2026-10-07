@@ -53,6 +53,8 @@ class Reader:
         self._notEnoughData = notEnoughData
         self._highway = highway_mode
         self._maxbuf = 0
+        self._dec_errors = None
+        self._sync_decoding()
 
     def feed(self, data, start=None, stop=None):
         """Feed bytes/bytearray/memoryview. (data, start, stop) slices a buffer."""
@@ -81,25 +83,27 @@ class Reader:
         (redis-py's disable_decoding path calls gets(False))."""
         if self._highway:
             return self._highway_gets()
-        status, payload = self._core.try_gets()
+        status, payload = self._core.try_gets(1 if should_decode else 0)
         if status == 0:
-            # clean reply, no nested error markers: the only Python-side work
-            # that can ever be needed is decoding
-            if self._encoding is not None and should_decode:
-                return self._finalize(payload, should_decode)
+            # string leaves were decoded in the core when an encoding is set
             return payload
         if status == 1:
             return self._notEnoughData
         if status == 6:
             # error markers inside the reply: _finalize builds replyError
-            # instances (and decodes)
+            # instances (strings are already decoded)
+            return self._finalize(payload, should_decode)
+        if status == 7:
+            # a leaf failed strict decoding: re-decode here so Python raises
+            # the real codec error
+            self._raise_decode_error(payload)
             return self._finalize(payload, should_decode)
         if status == 2:
             # hiredis always hands error text over as str, whatever
             # should_decode says (reader.c passes it through `"s"`)
-            raise self._protocolError(self._decode_msg(payload, True))
+            raise self._protocolError(self._decode_msg(payload))
         if status == 3:
-            return self._replyError(self._decode_msg(payload[1], True))
+            return self._replyError(self._decode_msg(payload[1]))
         if status == 4:
             return PushNotification(payload)
         raise TypeError("unhashable type in map reply")  # status 5
@@ -115,14 +119,18 @@ class Reader:
         """
         if self._highway:
             raise RuntimeError("drain() is not available in highway mode")
-        replies, proto_msg, dict_err, had_markers = self._core.drain()
+        replies, proto_msg, dict_err, had_markers, dec_failed = self._core.drain(
+            1 if should_decode else 0
+        )
         if dict_err:
             raise TypeError("unhashable type in map reply")
         if proto_msg is not None:
-            raise self._protocolError(self._decode_msg(proto_msg, True))
-        if had_markers or (self._encoding is not None and should_decode):
-            # only now does per-reply Python work (error instances, decoding)
-            # pay off; the common path returns the core's list untouched
+            raise self._protocolError(self._decode_msg(proto_msg))
+        if dec_failed:
+            self._raise_decode_error(replies)
+        if had_markers:
+            # only marker conversion needs Python now; the common path returns
+            # the core's list untouched
             replies = [self._finalize(r, should_decode) for r in replies]
         return replies
 
@@ -145,6 +153,7 @@ class Reader:
             codecs.lookup_error(errors)  # LookupError for unknown handlers
         self._encoding = encoding
         self._errors = errors
+        self._sync_decoding()
 
     def setmaxbuf(self, value):
         """hiredis parity: max buffer guard. Value stored; enforcement is
@@ -170,16 +179,39 @@ class Reader:
         """redis-py 8 can_read() support."""
         return self._core.buffered() > 0
 
-    def _decode_msg(self, msg, should_decode):
-        if not should_decode or isinstance(msg, str):
+    def _sync_decoding(self):
+        """Push the codec configuration into the core, which decodes string
+        leaves during the parse.  These str objects stay on self so the C
+        strings the core cached (PyUnicode_AsUTF8) remain valid."""
+        if self._encoding is None:
+            self._core.clear_decoding()
+        else:
+            self._dec_errors = self._errors if self._errors is not None else "strict"
+            self._core.set_decoding(self._encoding, self._dec_errors)
+
+    def _raise_decode_error(self, obj):
+        """A leaf failed strict decoding in the core; the undecoded bytes
+        were kept, so re-decoding here raises the real UnicodeDecodeError."""
+        if isinstance(obj, bytes):
+            obj.decode(self._encoding, self._errors or "strict")  # raises
+        elif isinstance(obj, list):
+            for item in obj:
+                self._raise_decode_error(item)
+        elif isinstance(obj, dict):
+            for key, value in obj.items():
+                self._raise_decode_error(key)
+                self._raise_decode_error(value)
+
+    def _decode_msg(self, msg):
+        if isinstance(msg, str):
             return msg
-        # hiredis always decodes error messages with errors="replace",
-        # regardless of the configured encoding/errors (verified 3.4.2)
-        return msg.decode(self._encoding or "utf-8", "replace")
+        # hiredis decodes error text as utf-8/"replace" whatever the
+        # configured encoding is (reader.c PyUnicode_DecodeUTF8)
+        return msg.decode("utf-8", "replace")
 
     def _finalize(self, obj, should_decode):
         if isinstance(obj, tuple) and obj and obj[0] == _ERR_SENTINEL:
-            return self._replyError(self._decode_msg(obj[1], True))
+            return self._replyError(self._decode_msg(obj[1]))
         if isinstance(obj, list):
             return [self._finalize(x, should_decode) for x in obj]
         if (

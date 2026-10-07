@@ -9,6 +9,7 @@ import gc
 import sys
 import tracemalloc
 
+import hiredis
 import pytest
 
 import hpredis
@@ -138,3 +139,42 @@ def test_bulk_strings_still_honour_should_decode():
     r = reader(encoding="utf-8")
     r.feed(b"$3\r\nabc\r\n")
     assert r.gets(True) == "abc"
+
+
+# --- native decoding (decoded in the core at leaf creation) ----------------
+
+
+def test_drain_decodes_and_honours_should_decode():
+    r = hpredis.Reader(encoding="utf-8")
+    r.feed(b"+a\r\n$1\r\nb\r\n")
+    assert r.drain() == ["a", "b"]
+    r = hpredis.Reader(encoding="utf-8")
+    r.feed(b"+a\r\n$1\r\nb\r\n")
+    assert r.drain(False) == [b"a", b"b"]
+
+
+def test_set_encoding_none_disables_core_decoding():
+    snowman = b"\xe2\x98\x83"
+    r = hpredis.Reader(encoding="utf-8")
+    r.feed(b"$3\r\n" + snowman + b"\r\n" + b"$3\r\n" + snowman + b"\r\n")
+    assert r.gets() == snowman.decode()
+    r.set_encoding(encoding=None, errors=None)
+    assert r.gets() == snowman
+
+
+def test_strict_decode_failure_matches_hiredis():
+    data = b"*2\r\n$1\r\na\r\n$2\r\n\xff\xfe\r\n"
+    messages = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader(encoding="utf-8")
+        r.feed(data)
+        with pytest.raises(UnicodeDecodeError) as excinfo:
+            r.gets(True)
+        messages.append(str(excinfo.value))
+    assert messages[0] == messages[1]
+
+
+def test_decode_leaves_are_str_in_containers_and_maps():
+    r = hpredis.Reader(encoding="utf-8")
+    r.feed(b"%1\r\n$1\r\nk\r\n*2\r\n$1\r\na\r\n:1\r\n")
+    assert r.gets() == {"k": ["a", 1]}

@@ -28,6 +28,8 @@ comptime ST_DICT_ERR = 5
 # clean reply that contains nested error markers: the wrapper must run
 # _finalize to build replyError instances
 comptime ST_OK_MARKERS = 6
+# a leaf failed strict decoding: the wrapper re-raises the real codec error
+comptime ST_DECODE_ERR = 7
 
 # nested error marker sentinel (tuple[0]); unique, never valid RESP data
 comptime ERR_SENTINEL = "\x00hpredis-error\x00"
@@ -81,6 +83,10 @@ struct Reader(Defaultable, Movable, Writable):
     var consumed: Int
     var proto_err: Bool
     var proto_err_msg: String
+    # decoding configuration (C string addresses owned by the wrapper)
+    var dec_enabled: Bool
+    var dec_encoding: Int
+    var dec_errors: Int
     var highway_slices: List[ResponseSlice]
     var highway_base: Int
 
@@ -91,6 +97,9 @@ struct Reader(Defaultable, Movable, Writable):
         self.consumed = 0
         self.proto_err = False
         self.proto_err_msg = String()
+        self.dec_enabled = False
+        self.dec_encoding = 0
+        self.dec_errors = 0
         self.highway_slices = List[ResponseSlice]()
         self.highway_base = 0
 
@@ -120,21 +129,49 @@ struct Reader(Defaultable, Movable, Writable):
         return PythonObject(0)
 
     @staticmethod
-    def try_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+    def set_decoding(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], encoding: PythonObject, errors: PythonObject) raises -> PythonObject:
+        """Cache codec C strings for in-core decoding.  PyUnicode_AsUTF8
+        points into the str objects, which the wrapper keeps alive."""
+        var enc = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](
+            encoding.steal_data())
+        var errs = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](
+            errors.steal_data())
+        self_ptr[].dec_encoding = Int(enc)
+        self_ptr[].dec_errors = Int(errs)
+        self_ptr[].dec_enabled = True
+        return PythonObject(0)
+
+    @staticmethod
+    def clear_decoding(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+        self_ptr[].dec_enabled = False
+        self_ptr[].dec_encoding = 0
+        self_ptr[].dec_errors = 0
+        return PythonObject(0)
+
+    @staticmethod
+    def try_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
         if self_ptr[].proto_err:
             # sticky protocol error (matches hiredis): keep raising
             return _status_tuple(ST_PROTO_ERR, _bytes_payload(self_ptr[].proto_err_msg))
         if self_ptr[].consumed >= self_ptr[].buf_len:
             return _status_tuple(ST_INCOMPLETE, _none_payload())
+        var sd = Int(py=should_decode)
+        var cnv = DecodeCtx(
+            enabled=self_ptr[].dec_enabled and sd != 0,
+            encoding=self_ptr[].dec_encoding,
+            errors=self_ptr[].dec_errors,
+            failed=False)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
-        var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
+        var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
         if node.status == ST_INCOMPLETE:
             return _status_tuple(ST_INCOMPLETE, _none_payload())
         if node.status == ST_OK or node.status == ST_PUSH:
             self_ptr[].consumed = node.pos
             _ = _compact(self_ptr[])
             var st = node.status
-            if node.status == ST_OK and node.had_err:
+            if cnv.failed:
+                st = ST_DECODE_ERR
+            elif node.status == ST_OK and node.had_err:
                 st = ST_OK_MARKERS
             return _status_tuple(st, node.payload.steal_data())
         if node.status == ST_REPLY_ERR:
@@ -152,43 +189,49 @@ struct Reader(Defaultable, Movable, Writable):
         return _status_tuple(ST_PROTO_ERR, node.payload.steal_data())
 
     @staticmethod
-    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
         """Parse every complete reply currently buffered, into one list.
 
         Returns (replies, proto_msg, dict_err, had_markers); see the wrapper's
         drain() for the contract.
         """
         var collected = List[PyObjectPtr]()
+        var sd = Int(py=should_decode)
+        var cnv = DecodeCtx(
+            enabled=self_ptr[].dec_enabled and sd != 0,
+            encoding=self_ptr[].dec_encoding,
+            errors=self_ptr[].dec_errors,
+            failed=False)
         if self_ptr[].proto_err:
             return _drain_result(
-                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), False, False)
+                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), False, False, False)
         if self_ptr[].consumed < self_ptr[].buf_len:
             var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
             var had_markers = False
             while True:
-                var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
+                var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
                 if node.status == ST_INCOMPLETE:
                     break
                 if node.status == ST_DICT_ERR:
                     # unhashable map key: consumed; the wrapper raises TypeError
                     self_ptr[].consumed = node.pos
                     _ = _compact(self_ptr[])
-                    return _drain_result(_list_of(collected), _none_payload(), True, True)
+                    return _drain_result(_list_of(collected), _none_payload(), True, True, cnv.failed)
                 if node.status == ST_PROTO_ERR:
                     # sticky and not consumed (matches gets)
                     self_ptr[].proto_err = True
                     self_ptr[].proto_err_msg = node.err_msg
                     _ = _compact(self_ptr[])
                     return _drain_result(
-                        _list_of(collected), _bytes_payload(node.err_msg), False, False)
+                        _list_of(collected), _bytes_payload(node.err_msg), False, False, cnv.failed)
                 if node.had_err:
                     had_markers = True
                 self_ptr[].consumed = node.pos
                 collected.append(node.payload.steal_data())
             # compact once for the whole batch (gets compacts per reply)
             _ = _compact(self_ptr[])
-            return _drain_result(_list_of(collected), _none_payload(), False, had_markers)
-        return _drain_result(_list_of(collected), _none_payload(), False, False)
+            return _drain_result(_list_of(collected), _none_payload(), False, had_markers, cnv.failed)
+        return _drain_result(_list_of(collected), _none_payload(), False, False, cnv.failed)
 
     @staticmethod
     def buffered(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
@@ -326,6 +369,40 @@ def _bytes_payload(s: String) raises -> PyObjectPtr:
         s.unsafe_ptr(), c_ssize_t(s.byte_length()))
 
 
+struct DecodeCtx(ImplicitlyCopyable):
+    """Decoding state threaded through a parse.  encoding/errors are C string
+    addresses owned by the wrapper's str objects (they outlive the parse)."""
+    var enabled: Bool
+    var encoding: Int
+    var errors: Int
+    var failed: Bool
+
+    def __init__(out self, enabled: Bool, encoding: Int, errors: Int, failed: Bool):
+        self.enabled = enabled
+        self.encoding = encoding
+        self.errors = errors
+        self.failed = failed
+
+
+def _leaf_payload(
+    ptr: Pointer[UInt8, MutAnyOrigin], offset: Int, length: Int, mut cnv: DecodeCtx
+) raises -> PyObjectPtr:
+    """String leaf: decoded in the core when an encoding is configured, so
+    decoding costs no extra Python pass (hiredis decodes the same way)."""
+    if cnv.enabled:
+        var res = external_call["PyUnicode_Decode", PyObjectPtr](
+            ptr.unsafe_offset(offset), c_ssize_t(length),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=cnv.encoding),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=cnv.errors))
+        if Int(res) != 0:
+            return res
+        # a Mojo raise would replace the pending codec error, so fall back to
+        # bytes and let the wrapper re-raise it
+        _ = Python().cpython().PyErr_Clear()
+        cnv.failed = True
+    return _bytes_slice_payload(ptr, offset, length)
+
+
 def _bytes_slice_payload(ptr: Pointer[UInt8, MutAnyOrigin], offset: Int, length: Int) raises -> PyObjectPtr:
     return external_call["PyBytes_FromStringAndSize", PyObjectPtr](
         ptr.unsafe_offset(offset), c_ssize_t(length))
@@ -349,14 +426,16 @@ def _tuple3(a: UInt8, b: Int, c: Int) raises -> PythonObject:
 
 
 def _drain_result(
-    replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_err: Bool, had_markers: Bool
+    replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_err: Bool, had_markers: Bool,
+    dec_failed: Bool
 ) raises -> PythonObject:
     ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(4)
+    var t = cpy.PyTuple_New(5)
     _ = cpy.PyTuple_SetItem(t, 0, replies)
     _ = cpy.PyTuple_SetItem(t, 1, proto_msg)
     _ = cpy.PyTuple_SetItem(t, 2, cpy.PyBool_FromLong(1) if dict_err else cpy.PyBool_FromLong(0))
     _ = cpy.PyTuple_SetItem(t, 3, cpy.PyBool_FromLong(1) if had_markers else cpy.PyBool_FromLong(0))
+    _ = cpy.PyTuple_SetItem(t, 4, cpy.PyBool_FromLong(1) if dec_failed else cpy.PyBool_FromLong(0))
     return PythonObject(from_owned=t)
 
 
@@ -478,7 +557,7 @@ comptime MAX_DEPTH = 1024
 
 
 def _parse_node(
-    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int
+    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int, mut cnv: DecodeCtx
 ) raises -> Node:
     if start >= end:
         return _incomplete_node(start)
@@ -503,7 +582,7 @@ def _parse_node(
             var err_node = Node(ST_REPLY_ERR, crlf + 2, PythonObject(from_owned=_error_marker(ptr.unsafe_offset(pstart), plen)))
             err_node.had_err = True
             return err_node^
-        var payload = _bytes_slice_payload(ptr, pstart, plen)
+        var payload = _leaf_payload(ptr, pstart, plen, cnv)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=payload))
     if t == TYPE_BULK:
         var after_int = start + 1
@@ -522,7 +601,7 @@ def _parse_node(
             return _incomplete_node(start)
         # hiredis does not validate the trailing CRLF after a bulk payload;
         # it consumes payload + 2 bytes unconditionally (verified 3.4.2)
-        return Node(ST_OK, pstart + blen + 2, PythonObject(from_owned=_bytes_slice_payload(ptr, pstart, blen)))
+        return Node(ST_OK, pstart + blen + 2, PythonObject(from_owned=_leaf_payload(ptr, pstart, blen, cnv)))
     if t == TYPE_ARRAY or t == 62:  # '*' or '>' (push)
         var after_int = start + 1
         var status: UInt8 = ST_OK
@@ -545,7 +624,7 @@ def _parse_node(
         var pos = after_int
         var saw_err = False
         for i in range(count):
-            var child = _parse_node(ptr, pos, end, depth + 1)
+            var child = _parse_node(ptr, pos, end, depth + 1, cnv)
             if child.status == ST_INCOMPLETE:
                 _ = cpy.Py_DecRef(list_obj)
                 return _incomplete_node(start)
@@ -603,7 +682,7 @@ def _parse_node(
         if colon >= 0:
             vpos = colon + 1
             vlen2 = pstart + vlen - vpos
-        return Node(ST_OK, pstart + vlen + 2, PythonObject(from_owned=_bytes_slice_payload(ptr, vpos, vlen2)))
+        return Node(ST_OK, pstart + vlen + 2, PythonObject(from_owned=_leaf_payload(ptr, vpos, vlen2, cnv)))
     if t == 126:  # '~' set -> plain list (hiredis-py parity)
         var after_int2 = start + 1
         var status2: UInt8 = ST_OK
@@ -621,7 +700,7 @@ def _parse_node(
         var spos = after_int2
         var saw_err2 = False
         for i2 in range(count2):
-            var child2 = _parse_node(ptr, spos, end, depth + 1)
+            var child2 = _parse_node(ptr, spos, end, depth + 1, cnv)
             if child2.status == ST_INCOMPLETE:
                 _ = cpy3.Py_DecRef(set_list)
                 return _incomplete_node(start)
@@ -652,7 +731,7 @@ def _parse_node(
         var mpos = after_int3
         var saw_err3 = False
         for i3 in range(pairs):
-            var key_node = _parse_node(ptr, mpos, end, depth + 1)
+            var key_node = _parse_node(ptr, mpos, end, depth + 1, cnv)
             if key_node.status == ST_INCOMPLETE:
                 _ = cpy4.Py_DecRef(dict_obj)
                 return _incomplete_node(start)
@@ -662,7 +741,7 @@ def _parse_node(
             if key_node.had_err:
                 saw_err3 = True
             mpos = key_node.pos
-            var val_node = _parse_node(ptr, mpos, end, depth + 1)
+            var val_node = _parse_node(ptr, mpos, end, depth + 1, cnv)
             if val_node.status == ST_INCOMPLETE:
                 _ = cpy4.Py_DecRef(dict_obj)
                 return _incomplete_node(start)
@@ -802,6 +881,8 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_init_defaultable[Reader]() \
             .def_method[Reader.feed]("feed") \
             .def_method[Reader.try_gets]("try_gets") \
+            .def_method[Reader.set_decoding]("set_decoding") \
+            .def_method[Reader.clear_decoding]("clear_decoding") \
             .def_method[Reader.drain]("drain") \
             .def_method[Reader.buffered]("buffered") \
             .def_method[Reader.highway_gets]("highway_gets") \
