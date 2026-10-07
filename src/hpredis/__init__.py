@@ -120,8 +120,8 @@ class Reader:
         """
         if self._highway:
             raise RuntimeError("drain() is not available in highway mode")
-        replies, proto_msg, dict_err, had_markers, dec_failed = self._core.drain(
-            1 if should_decode else 0
+        replies, proto_msg, dict_err, had_markers, dec_failed, raise_msg = self._core.drain(
+            1 if should_decode else 0, self._replyError
         )
         if dict_err:
             raise TypeError("unhashable type in map reply")
@@ -129,9 +129,14 @@ class Reader:
             raise self._protocolError(self._decode_msg(proto_msg))
         if dec_failed:
             self._raise_decode_error(replies)
+        if raise_msg is not None:
+            # the core called replyError and it raised (redis-py's parse_error
+            # raises by design): calling it here surfaces the real exception,
+            # and the replies already parsed stay valid
+            replies.append(self._replyError(self._decode_msg(raise_msg)))
         if had_markers:
-            # only marker conversion needs Python now; the common path returns
-            # the core's list untouched
+            # nested markers (an array holding an error) are the only case that
+            # still needs the Python walk
             replies = [self._finalize(r, should_decode) for r in replies]
         return replies
 

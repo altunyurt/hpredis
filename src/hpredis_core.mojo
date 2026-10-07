@@ -220,14 +220,19 @@ struct Reader(Defaultable, Movable, Writable):
         return PythonObject(0)
 
     @staticmethod
-    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
+    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject, reply_error: PythonObject) raises -> PythonObject:
         """Parse every complete reply currently buffered, into one list.
 
-        Returns (replies, proto_msg, dict_err, had_markers); see the wrapper's
-        drain() for the contract.
+        Top-level error replies become replyError instances here: the wrapper's
+        Python walk over the result cost ~140ns per reply.  Returns (replies,
+        proto_msg, dict_err, nested_markers, dec_failed, raise_msg); raise_msg
+        is set when the callable raised (the wrapper re-runs it in Python so the
+        caller sees the real exception).
         """
         var collected = List[PyObjectPtr]()
         var sd = Int(py=should_decode)
+        var re_ptr = Int(reply_error.steal_data())
+        var raise_msg = _none_payload()
         var cnv = DecodeCtx(
             enabled=self_ptr[].dec_enabled and sd != 0,
             encoding=self_ptr[].dec_encoding,
@@ -235,7 +240,7 @@ struct Reader(Defaultable, Movable, Writable):
             failed=False)
         if self_ptr[].proto_err:
             return _drain_result(
-                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), False, False, False)
+                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), False, False, False, _none_payload())
         if self_ptr[].consumed < self_ptr[].buf_len:
             var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
             var had_markers = False
@@ -253,22 +258,44 @@ struct Reader(Defaultable, Movable, Writable):
                     # unhashable map key: consumed; the wrapper raises TypeError
                     self_ptr[].consumed = node.pos
                     _ = _compact(self_ptr[])
-                    return _drain_result(_list_of(collected), _none_payload(), True, True, cnv.failed)
+                    return _drain_result(
+                        _list_of(collected), _none_payload(), True, True, cnv.failed, _none_payload())
                 if node.status == ST_PROTO_ERR:
                     # sticky and not consumed (matches gets)
                     self_ptr[].proto_err = True
                     self_ptr[].proto_err_msg = node.err_msg
                     _ = _compact(self_ptr[])
                     return _drain_result(
-                        _list_of(collected), _bytes_payload(node.err_msg), False, False, cnv.failed)
-                if node.had_err:
+                        _list_of(collected), _bytes_payload(node.err_msg), False, False, cnv.failed, _none_payload())
+                if node.status == ST_REPLY_ERR and re_ptr != 0:
+                    self_ptr[].consumed = node.pos
+                    var marker = Int(node.payload.steal_data())
+                    var inst = _marker_to_instance(re_ptr, marker)
+                    if inst != 0:
+                        collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+                            unsafe_from_address=inst)))
+                        continue
+                    # the callable raised: stop here and let the wrapper re-run
+                    # it in Python, where the exception propagates properly
+                    var m = external_call["PyTuple_GetItem", PyObjectPtr](
+                        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker), c_ssize_t(1))
+                    _ = Python().cpython().Py_IncRef(m)
+                    raise_msg = m
+                    _ = external_call["Py_DecRef", NoneType](
+                        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker))
+                    break
+                if node.status == ST_OK and node.had_err:
+                    # nested markers (e.g. an array holding an error) still need
+                    # the wrapper's walk
                     had_markers = True
                 self_ptr[].consumed = node.pos
                 collected.append(node.payload.steal_data())
             # compact once for the whole batch (gets compacts per reply)
             _ = _compact(self_ptr[])
-            return _drain_result(_list_of(collected), _none_payload(), False, had_markers, cnv.failed)
-        return _drain_result(_list_of(collected), _none_payload(), False, False, cnv.failed)
+            return _drain_result(
+                _list_of(collected), _none_payload(), False, had_markers, cnv.failed, raise_msg)
+        return _drain_result(
+            _list_of(collected), _none_payload(), False, False, cnv.failed, _none_payload())
 
     @staticmethod
     def buffered(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
@@ -558,15 +585,16 @@ def _hw_tuple(a: PyObjectPtr, b: PyObjectPtr, c: PyObjectPtr) raises -> PythonOb
 
 def _drain_result(
     replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_err: Bool, had_markers: Bool,
-    dec_failed: Bool
+    dec_failed: Bool, raise_msg: PyObjectPtr
 ) raises -> PythonObject:
     ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(5)
+    var t = cpy.PyTuple_New(6)
     _ = cpy.PyTuple_SetItem(t, 0, replies)
     _ = cpy.PyTuple_SetItem(t, 1, proto_msg)
     _ = cpy.PyTuple_SetItem(t, 2, cpy.PyBool_FromLong(1) if dict_err else cpy.PyBool_FromLong(0))
     _ = cpy.PyTuple_SetItem(t, 3, cpy.PyBool_FromLong(1) if had_markers else cpy.PyBool_FromLong(0))
     _ = cpy.PyTuple_SetItem(t, 4, cpy.PyBool_FromLong(1) if dec_failed else cpy.PyBool_FromLong(0))
+    _ = cpy.PyTuple_SetItem(t, 5, raise_msg)
     return PythonObject(from_owned=t)
 
 
@@ -583,6 +611,42 @@ def _list_of(imm collected: List[PyObjectPtr]) raises -> PyObjectPtr:
         _ = cpy.PyList_SetItem(lst, i, collected[i])
     return lst
 
+
+def _marker_to_instance(re_ptr: Int, marker_ptr: Int) -> Int:
+    """Turn an error marker tuple into a replyError instance in the core.
+
+    Returns 0 (with the pending exception cleared) when the callable raised -
+    redis-py's parse_error does, by design - so the caller can report it back
+    and let the wrapper re-run the callable in Python, where the exception
+    propagates properly.
+    """
+    ref cpy = Python().cpython()
+    var msg = external_call["PyTuple_GetItem", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker_ptr), c_ssize_t(1))
+    if Int(msg) == 0:
+        _ = cpy.PyErr_Clear()
+        return 0
+    # hiredeis hands error text over as str, always (utf-8/"replace")
+    var bp = external_call["PyBytes_AsString", Pointer[UInt8, MutAnyOrigin]](msg)
+    var bn = Int(external_call["PyBytes_Size", c_ssize_t](msg))
+    var enc = String("utf-8")
+    var errs = String("replace")
+    var text = external_call["PyUnicode_Decode", PyObjectPtr](
+        bp, c_ssize_t(bn),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(enc.unsafe_ptr())),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(errs.unsafe_ptr())))
+    if Int(text) == 0:
+        _ = cpy.PyErr_Clear()
+        return 0
+    var args = cpy.PyTuple_New(1)
+    _ = cpy.PyTuple_SetItem(args, 0, text)
+    var inst = external_call["PyObject_CallObject", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr), args)
+    _ = cpy.Py_DecRef(args)
+    if Int(inst) == 0:
+        _ = cpy.PyErr_Clear()
+        return 0
+    return Int(inst)
 
 def _error_marker(msg_ptr: Pointer[UInt8, MutAnyOrigin], length: Int) raises -> PyObjectPtr:
     """Nested error reply → (sentinel_bytes, message_bytes)."""

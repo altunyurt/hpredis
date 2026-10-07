@@ -264,3 +264,38 @@ def test_reader_gc_does_not_leak_the_arena():
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
     # 500 x 64KB is 32MB of arena; leaking it would show up as ~64MB peak
     assert peak - before < 32
+
+
+# --- drain(): error replies built in the core ------------------------------
+
+
+def test_drain_builds_error_instances_in_the_core():
+    r = hpredis.Reader()
+    r.feed(b"+OK\r\n-ERR one\r\n+NEXT\r\n")
+    replies = r.drain()
+    assert [type(x).__name__ for x in replies] == ["bytes", "ReplyError", "bytes"]
+    assert replies[1].args[0] == "ERR one"       # str, always (hiredis parity)
+
+
+def test_drain_reports_a_raising_reply_error_and_stays_consistent():
+    class Boom(Exception):
+        pass
+
+    def parse_error(msg):
+        raise Boom(msg)
+
+    r = hpredis.Reader(replyError=parse_error)
+    r.feed(b"+OK\r\n-ERR one\r\n+NEXT\r\n")
+    with pytest.raises(Boom) as excinfo:
+        r.drain()
+    assert str(excinfo.value) == "ERR one"
+    # the error reply was consumed, the rest of the batch is still pending
+    assert r.gets() == b"NEXT"
+
+
+def test_drain_still_converts_nested_markers():
+    r = hpredis.Reader()
+    r.feed(b"*2\r\n$1\r\na\r\n-ERR nested\r\n")
+    replies = r.drain()
+    assert isinstance(replies[0][1], hpredis.ReplyError)
+    assert replies[0][1].args[0] == "ERR nested"
