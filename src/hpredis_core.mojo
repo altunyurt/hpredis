@@ -99,11 +99,13 @@ struct Reader(Defaultable, Movable, Writable):
     @staticmethod
     def feed(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], data: PythonObject) raises -> PythonObject:
         """Copy a buffer-protocol object (bytes/bytearray/memoryview) into the arena."""
-        var raw = data.steal_data()
+        ref cpy = Python().cpython()
+        var raw = data.steal_data()  # steal_data detaches the ref: release it below
         var view = PyBuffer()
         var rc = external_call["PyObject_GetBuffer", c_int](
             raw, Pointer(to=view), c_int(0))  # PyBUF_SIMPLE
         if rc != 0:
+            _ = cpy.Py_DecRef(raw)
             raise Error("feed() expects a buffer-protocol object")
         var n = Int(view.len)
         if n > 0:
@@ -114,6 +116,7 @@ struct Reader(Defaultable, Movable, Writable):
                 dst, view.buf.value(), c_size_t(n))
             self_ptr[].buf_len += n
         _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+        _ = cpy.Py_DecRef(raw)
         return PythonObject(0)
 
     @staticmethod
@@ -124,7 +127,7 @@ struct Reader(Defaultable, Movable, Writable):
         if self_ptr[].consumed >= self_ptr[].buf_len:
             return _status_tuple(ST_INCOMPLETE, _none_payload())
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
-        var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len)
+        var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
         if node.status == ST_INCOMPLETE:
             return _status_tuple(ST_INCOMPLETE, _none_payload())
         if node.status == ST_OK or node.status == ST_PUSH:
@@ -163,7 +166,7 @@ struct Reader(Defaultable, Movable, Writable):
             var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
             var had_markers = False
             while True:
-                var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len)
+                var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
                 if node.status == ST_INCOMPLETE:
                     break
                 if node.status == ST_DICT_ERR:
@@ -310,7 +313,11 @@ def _compact(mut r: Reader) -> Bool:
 # === Result helpers ===
 
 def _none_payload() -> PyObjectPtr:
-    return Python().cpython().Py_None()  # borrowed; None is immortal
+    # callers wrap this with from_owned, so hand over an owned reference
+    ref cpy = Python().cpython()
+    var none = cpy.Py_None()
+    _ = cpy.Py_IncRef(none)
+    return none
 
 
 def _bytes_payload(s: String) raises -> PyObjectPtr:
@@ -466,7 +473,13 @@ def _incomplete_node(pos: Int) raises -> Node:
     return Node(ST_INCOMPLETE, pos, PythonObject(from_owned=_bytes_payload(String())))
 
 
-def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises -> Node:
+# hiredis caps nesting at 1024 containers and reports this exact message
+comptime MAX_DEPTH = 1024
+
+
+def _parse_node(
+    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int
+) raises -> Node:
     if start >= end:
         return _incomplete_node(start)
     var t = ptr.unsafe_offset(start)[]
@@ -486,11 +499,11 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
                 return _proto_node(start, "Bad integer value")
             ref cpy = Python().cpython()
             return Node(ST_OK, after_crlf, PythonObject(from_owned=cpy.PyLong_FromSsize_t(value)))
-        var payload = _bytes_slice_payload(ptr, pstart, plen)
         if t == TYPE_ERROR:
             var err_node = Node(ST_REPLY_ERR, crlf + 2, PythonObject(from_owned=_error_marker(ptr.unsafe_offset(pstart), plen)))
             err_node.had_err = True
             return err_node^
+        var payload = _bytes_slice_payload(ptr, pstart, plen)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=payload))
     if t == TYPE_BULK:
         var after_int = start + 1
@@ -522,15 +535,22 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
             return _proto_node(start, "Multi-bulk length out of range")
         if count == -1:
             return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
+        if depth > MAX_DEPTH:
+            return _proto_node(start, "Max nesting depth exceeded")
+        if count > (end - after_int) // 3:
+            # fewer than 3 bytes per element left: this reply can never complete
+            return _incomplete_node(start)
         ref cpy = Python().cpython()
         var list_obj = cpy.PyList_New(count)
         var pos = after_int
         var saw_err = False
         for i in range(count):
-            var child = _parse_node(ptr, pos, end)
+            var child = _parse_node(ptr, pos, end, depth + 1)
             if child.status == ST_INCOMPLETE:
+                _ = cpy.Py_DecRef(list_obj)
                 return _incomplete_node(start)
             if child.status == ST_PROTO_ERR:
+                _ = cpy.Py_DecRef(list_obj)
                 return _proto_node(start, child.err_msg)
             if child.had_err:
                 saw_err = True
@@ -592,15 +612,21 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
             return _incomplete_node(start)
         if status2 == ST_PROTO_ERR or count2 < 0:
             return _proto_node(start, "Bad set length")
+        if depth > MAX_DEPTH:
+            return _proto_node(start, "Max nesting depth exceeded")
+        if count2 > (end - after_int2) // 3:
+            return _incomplete_node(start)
         ref cpy3 = Python().cpython()
         var set_list = cpy3.PyList_New(count2)
         var spos = after_int2
         var saw_err2 = False
         for i2 in range(count2):
-            var child2 = _parse_node(ptr, spos, end)
+            var child2 = _parse_node(ptr, spos, end, depth + 1)
             if child2.status == ST_INCOMPLETE:
+                _ = cpy3.Py_DecRef(set_list)
                 return _incomplete_node(start)
             if child2.status == ST_PROTO_ERR:
+                _ = cpy3.Py_DecRef(set_list)
                 return _proto_node(start, child2.err_msg)
             if child2.had_err:
                 saw_err2 = True
@@ -617,32 +643,45 @@ def _parse_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises 
             return _incomplete_node(start)
         if status3 == ST_PROTO_ERR or pairs < 0:
             return _proto_node(start, "Bad map length")
+        if depth > MAX_DEPTH:
+            return _proto_node(start, "Max nesting depth exceeded")
+        if pairs > (end - after_int3) // 6:
+            return _incomplete_node(start)
         ref cpy4 = Python().cpython()
         var dict_obj = cpy4.PyDict_New()
         var mpos = after_int3
         var saw_err3 = False
         for i3 in range(pairs):
-            var key_node = _parse_node(ptr, mpos, end)
+            var key_node = _parse_node(ptr, mpos, end, depth + 1)
             if key_node.status == ST_INCOMPLETE:
+                _ = cpy4.Py_DecRef(dict_obj)
                 return _incomplete_node(start)
             if key_node.status == ST_PROTO_ERR:
+                _ = cpy4.Py_DecRef(dict_obj)
                 return _proto_node(start, key_node.err_msg)
             if key_node.had_err:
                 saw_err3 = True
             mpos = key_node.pos
-            var val_node = _parse_node(ptr, mpos, end)
+            var val_node = _parse_node(ptr, mpos, end, depth + 1)
             if val_node.status == ST_INCOMPLETE:
+                _ = cpy4.Py_DecRef(dict_obj)
                 return _incomplete_node(start)
             if val_node.status == ST_PROTO_ERR:
+                _ = cpy4.Py_DecRef(dict_obj)
                 return _proto_node(start, val_node.err_msg)
             if val_node.had_err:
                 saw_err3 = True
             mpos = val_node.pos
-            var rc = cpy4.PyDict_SetItem(
-                dict_obj, key_node.payload.steal_data(), val_node.payload.steal_data())
+            # PyDict_SetItem increfs, so release the refs we stole either way
+            var kp = key_node.payload.steal_data()
+            var vp = val_node.payload.steal_data()
+            var rc = cpy4.PyDict_SetItem(dict_obj, kp, vp)
+            _ = cpy4.Py_DecRef(kp)
+            _ = cpy4.Py_DecRef(vp)
             if rc != 0:
                 # unhashable key etc: clear the CPython error, signal the wrapper
                 cpy4.PyErr_Clear()
+                _ = cpy4.Py_DecRef(dict_obj)
                 return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=cpy4.Py_None()))
         var map_node = Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
         map_node.had_err = saw_err3
@@ -660,54 +699,6 @@ def _find_byte(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, byte: UI
         return -1
     return Int(hit) - Int(ptr)
 
-
-def _parse_float(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) raises -> Float64:
-    """strtod-lite: sign, digits, optional fraction, optional exponent."""
-    var i = start
-    var neg = False
-    if i < end and ptr.unsafe_offset(i)[] == 45:
-        neg = True
-        i += 1
-    elif i < end and ptr.unsafe_offset(i)[] == 43:
-        i += 1
-    var value = 0.0
-    while i < end:
-        var c = Int(ptr.unsafe_offset(i)[])
-        if not (48 <= c <= 57):
-            break
-        value = value * 10.0 + Float64(c - 48)
-        i += 1
-    if i < end and ptr.unsafe_offset(i)[] == 46:  # '.'
-        i += 1
-        var frac = 0.1
-        while i < end:
-            var c2 = Int(ptr.unsafe_offset(i)[])
-            if not (48 <= c2 <= 57):
-                break
-            value += Float64(c2 - 48) * frac
-            frac *= 0.1
-            i += 1
-    if i < end and (ptr.unsafe_offset(i)[] == 101 or ptr.unsafe_offset(i)[] == 69):  # e/E
-        i += 1
-        var eneg = False
-        if i < end and ptr.unsafe_offset(i)[] == 45:
-            eneg = True
-            i += 1
-        elif i < end and ptr.unsafe_offset(i)[] == 43:
-            i += 1
-        var exp = 0
-        while i < end:
-            var c3 = Int(ptr.unsafe_offset(i)[])
-            if not (48 <= c3 <= 57):
-                break
-            exp = exp * 10 + c3 - 48
-            i += 1
-        if eneg:
-            exp = -exp
-        value = value * pow(10.0, exp)
-    if i != end:
-        raise Error("invalid RESP float")
-    return -value if neg else value
 
 
 def _hex_byte(b: Int) -> String:

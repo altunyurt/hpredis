@@ -95,9 +95,11 @@ class Reader:
             # instances (and decodes)
             return self._finalize(payload, should_decode)
         if status == 2:
-            raise self._protocolError(self._decode_msg(payload, should_decode))
+            # hiredis always hands error text over as str, whatever
+            # should_decode says (reader.c passes it through `"s"`)
+            raise self._protocolError(self._decode_msg(payload, True))
         if status == 3:
-            return self._replyError(self._decode_msg(payload[1], should_decode))
+            return self._replyError(self._decode_msg(payload[1], True))
         if status == 4:
             return PushNotification(payload)
         raise TypeError("unhashable type in map reply")  # status 5
@@ -117,7 +119,7 @@ class Reader:
         if dict_err:
             raise TypeError("unhashable type in map reply")
         if proto_msg is not None:
-            raise self._protocolError(self._decode_msg(proto_msg, should_decode))
+            raise self._protocolError(self._decode_msg(proto_msg, True))
         if had_markers or (self._encoding is not None and should_decode):
             # only now does per-reply Python work (error instances, decoding)
             # pay off; the common path returns the core's list untouched
@@ -177,7 +179,7 @@ class Reader:
 
     def _finalize(self, obj, should_decode):
         if isinstance(obj, tuple) and obj and obj[0] == _ERR_SENTINEL:
-            return self._replyError(self._decode_msg(obj[1], should_decode))
+            return self._replyError(self._decode_msg(obj[1], True))
         if isinstance(obj, list):
             return [self._finalize(x, should_decode) for x in obj]
         if (
