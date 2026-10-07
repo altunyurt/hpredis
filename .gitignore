@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+__mojocache__/
+.venv/
+build/
+dist/
+*.so
+*.pyd
+docs
+dev

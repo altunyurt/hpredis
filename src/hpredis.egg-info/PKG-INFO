@@ -1,0 +1,91 @@
+Metadata-Version: 2.4
+Name: hpredis
+Version: 0.1.0
+Summary: Add your description here
+Author-email: Özgür Altunyurt <altunyurt@gmail.com>
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+
+# hpredis — a Mojo drop-in replacement for hiredis-py
+
+A Mojo-based RESP parser that is interface-identical to
+[hiredis-py](https://github.com/redis/hiredis-py), plus an optional
+zero-copy **Highway Mode** for AI/ML vector workloads.
+
+```python
+import hpredis
+
+# classic: drop-in for hiredis.Reader (feed/gets, redis-py compatible)
+r = hpredis.Reader()
+r.feed(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
+assert r.gets() == [b"hello", b"world"]
+
+# highway: zero-copy pointers -> memoryview -> NumPy (no per-byte copies)
+h = hpredis.Reader(highway_mode=True)
+h.feed(b"$6144\r\n" + vector_bytes + b"\r\n")
+addr, count = h.gets()
+mv = h.memoryview(0)
+arr = np.frombuffer(mv, dtype=np.float32)   # shares memory, ~1.4 µs
+```
+
+## Features
+
+- `Reader(protocolError, replyError, encoding, errors, notEnoughData,
+  highway_mode)` — full hiredis-py 3.4.2 interface parity, verified by a
+  seeded **differential fuzzer** (300+ mutated payloads, fragmented feeds,
+  multi-reply streams, 5 MB bulks, depth-50 nesting) with hiredis-py as the
+  oracle
+- redis-py 8.1 integration tested end-to-end (ping/get/set/hset/incr/lrange/
+  pipelines, `decode_responses`, `CLIENT SETINFO`, fragmented recv)
+- Highway mode: read-only zero-copy `memoryview`s over the parser arena,
+  directly consumable by NumPy/PyTorch/JAX via the buffer protocol
+- Zero Python-heap traffic on feed+parse; allocations constant regardless of
+  payload size
+
+## Install
+
+```bash
+pip install hpredis          # platform wheel, no toolchain required
+```
+
+Building from source (requires the Mojo toolchain — `pip install mojo`):
+
+```bash
+uv sync                      # dev env: mojo, pytest, hiredis, redis, numpy
+./dev/phase/05/output/build_release.sh   # compiles src/hpredis/hpredis_core.so
+uv build --wheel             # platform-tagged wheel
+pytest                       # 55 tests across the 5 TDD phases
+```
+
+## Benchmark matrix (advisory, single machine)
+
+```
+corpus         hiredis      hpredis   highway
+multibulk-10k  1893.7 MB/s   349.7    1190.6
+simples-100k     45.2 MB/s    10.5      15.0
+vector-1536f32 13960.7 MB/s  6088.9    1385.6
+deep-50          96.8 MB/s    14.7     127.2
+```
+
+## Architecture
+
+```
+Python bytes ──feed──► Mojo arena (malloc/realloc, C-heap only)
+                          │  RESP scanner (memchr CRLF search)
+                          ├─► classic: CPython C-API objects (list/bytes/int)
+                          └─► highway: (addr, count) + memoryview slices
+```
+
+Five TDD phases, each with spec + tests + self-contained output
+(`dev/phase/NN/`): engine (1) → dual output (2) → hiredis-parity Reader (3)
+→ AI highway (4) → fuzz/bench/distribution (5). The release bundle is
+built from the phase-4 output by `dev/phase/05/output/build_release.sh`.
+
+## Limitations
+
+- Classic mode is 0.15–0.45× hiredis-py throughput (advisory, unoptimized v1)
+- RESP3 types (maps, push notifications, `pack_command`) not yet supported;
+  RESP2 covers the redis-py default paths
+- Highway memoryviews borrow the arena: valid until the next `feed()`
+  that grows/moves that reply's bytes
+- Protocol-error messages match hiredis byte-for-byte, including escapes
