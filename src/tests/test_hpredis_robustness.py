@@ -232,3 +232,35 @@ def test_chunked_protocol_error_is_reported_once_complete():
     assert r.gets(False) == [b"a", b"b"]
     with pytest.raises(hpredis.ProtocolError):
         r.gets(False)
+
+
+# --- arena lifetime --------------------------------------------------------
+
+
+def test_close_releases_arena_and_is_idempotent():
+    r = hpredis.Reader()
+    r.feed(b"+OK\r\n")
+    assert r.gets(False) == b"OK"
+    r.close()
+    r.close()  # no double free
+    # the reader stays usable: the arena is reallocated on the next feed
+    r.feed(b"+AGAIN\r\n")
+    assert r.gets(False) == b"AGAIN"
+
+
+def test_reader_gc_does_not_leak_the_arena():
+    # the arena is raw C memory the Mojo struct does not own; the wrapper's
+    # __del__ frees it.  Bounded on purpose (500 x 64KB), and peak RSS is
+    # checked so a regression fails loudly here instead of OOM-ing a machine.
+    import resource
+
+    before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    for _ in range(500):
+        r = hpredis.Reader()
+        r.feed(b"$65536\r\n" + b"x" * 65536 + b"\r\n")
+        r.gets(False)
+        del r
+    gc.collect()
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss // 1024
+    # 500 x 64KB is 32MB of arena; leaking it would show up as ~64MB peak
+    assert peak - before < 32

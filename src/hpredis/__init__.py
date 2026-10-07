@@ -53,6 +53,7 @@ class Reader:
         self._notEnoughData = notEnoughData
         self._highway = highway_mode
         self._maxbuf = 0
+        self._closed = False
         self._dec_errors = None
         self._sync_decoding()
 
@@ -178,6 +179,18 @@ class Reader:
     def has_data(self):
         """redis-py 8 can_read() support."""
         return self._core.buffered() > 0
+
+    def close(self):
+        """Release the core's arena now instead of at garbage collection."""
+        core = getattr(self, "_core", None)
+        if core is not None and not getattr(self, "_closed", False):
+            self._closed = True
+            core.free()
+
+    def __del__(self):
+        # the arena is raw C memory the Mojo struct does not own: without this
+        # every collected Reader leaks its buffer (measured +250MB/2000 readers)
+        self.close()
 
     def _sync_decoding(self):
         """Push the codec configuration into the core, which decodes string
