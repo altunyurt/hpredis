@@ -178,3 +178,54 @@ def test_decode_leaves_are_str_in_containers_and_maps():
     r = hpredis.Reader(encoding="utf-8")
     r.feed(b"%1\r\n$1\r\nk\r\n*2\r\n$1\r\na\r\n:1\r\n")
     assert r.gets() == {"k": ["a", 1]}
+
+
+# --- chunked feeding (scan-then-build path) --------------------------------
+
+
+def _drain_chunked(payload, chunk, use_gets=False):
+    r = hpredis.Reader()
+    out = []
+    for off in range(0, len(payload), chunk):
+        r.feed(payload[off : off + chunk])
+        if use_gets:
+            while True:
+                value = r.gets(False)
+                if value is False:
+                    break
+                out.append(value)
+        else:
+            out.extend(r.drain(False))
+    return out
+
+
+@pytest.mark.parametrize("chunk", [1, 2, 3, 7, 64, 4096, 65536])
+@pytest.mark.parametrize("use_gets", [False, True])
+def test_chunked_feeding_matches_single_feed(chunk, use_gets):
+    payload = (b"*5\r\n$3\r\nfoo\r\n:42\r\n+bar\r\n$0\r\n\r\n-ERR x\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n") * 20
+    one = hpredis.Reader()
+    one.feed(payload)
+    want = one.drain(False)
+    assert repr(_drain_chunked(payload, chunk, use_gets)) == repr(want)
+
+
+def test_chunked_large_array_matches_single_feed():
+    payload = b"*2000\r\n" + (b"$8\r\n" + b"x" * 8 + b"\r\n") * 2000
+    one = hpredis.Reader()
+    one.feed(payload)
+    want = one.drain(False)
+    for chunk in (777, 8192):
+        assert repr(_drain_chunked(payload, chunk)) == repr(want)
+
+
+def test_chunked_protocol_error_is_reported_once_complete():
+    # the error sits past the first chunk boundary: both the scan and the
+    # builder must agree that the reply is complete before reporting it
+    payload = b"*2\r\n$1\r\na\r\n$1\r\nb\r\n?bad\r\n"
+    r = hpredis.Reader()
+    r.feed(payload[:12])
+    assert r.gets(False) is False
+    r.feed(payload[12:])
+    assert r.gets(False) == [b"a", b"b"]
+    with pytest.raises(hpredis.ProtocolError):
+        r.gets(False)

@@ -87,6 +87,8 @@ struct Reader(Defaultable, Movable, Writable):
     var dec_enabled: Bool
     var dec_encoding: Int
     var dec_errors: Int
+    # a build attempt hit an incomplete reply: scan before rebuilding
+    var needs_scan: Bool
     var highway_slices: List[ResponseSlice]
     var highway_base: Int
 
@@ -100,6 +102,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.dec_enabled = False
         self.dec_encoding = 0
         self.dec_errors = 0
+        self.needs_scan = False
         self.highway_slices = List[ResponseSlice]()
         self.highway_base = 0
 
@@ -162,9 +165,18 @@ struct Reader(Defaultable, Movable, Writable):
             errors=self_ptr[].dec_errors,
             failed=False)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
+        if self_ptr[].needs_scan:
+            # a previous chunk was incomplete: rebuild only once a scan says
+            # the whole reply is buffered (chunked replies are otherwise
+            # rebuilt from scratch on every chunk)
+            var sc = _scan_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
+            if sc.status == ST_INCOMPLETE:
+                return _status_tuple(ST_INCOMPLETE, _none_payload())
         var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
         if node.status == ST_INCOMPLETE:
+            self_ptr[].needs_scan = True
             return _status_tuple(ST_INCOMPLETE, _none_payload())
+        self_ptr[].needs_scan = False
         if node.status == ST_OK or node.status == ST_PUSH:
             self_ptr[].consumed = node.pos
             _ = _compact(self_ptr[])
@@ -209,9 +221,15 @@ struct Reader(Defaultable, Movable, Writable):
             var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
             var had_markers = False
             while True:
+                if self_ptr[].needs_scan:
+                    var sc = _scan_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
+                    if sc.status == ST_INCOMPLETE:
+                        break
                 var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
                 if node.status == ST_INCOMPLETE:
+                    self_ptr[].needs_scan = True
                     break
+                self_ptr[].needs_scan = False
                 if node.status == ST_DICT_ERR:
                     # unhashable map key: consumed; the wrapper raises TypeError
                     self_ptr[].consumed = node.pos
@@ -554,6 +572,163 @@ def _incomplete_node(pos: Int) raises -> Node:
 
 # hiredis caps nesting at 1024 containers and reports this exact message
 comptime MAX_DEPTH = 1024
+
+
+struct ScanResult(ImplicitlyCopyable):
+    """Scan outcome: like Node but without any Python objects."""
+    var status: UInt8
+    var pos: Int
+
+    def __init__(out self, status: UInt8, pos: Int):
+        self.status = status
+        self.pos = pos
+
+
+def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int) -> ScanResult:
+    """Completeness pass: walks the structure creating nothing.
+
+    A chunked reply that is still incomplete sets Reader.needs_scan; the next
+    chunks are then only scanned until the whole reply is buffered, instead of
+    rebuilding every object from scratch on every chunk (O(n^2) on the socket
+    read path).  Protocol errors are left to the builder, which owns the exact
+    messages.
+    """
+    if start >= end:
+        return ScanResult(ST_INCOMPLETE, start)
+    var t = ptr.unsafe_offset(start)[]
+    if t == TYPE_SIMPLE or t == TYPE_ERROR or t == TYPE_INT:
+        var crlf = _find_crlf(ptr, start + 1, end)
+        if crlf < 0:
+            return ScanResult(ST_INCOMPLETE, start)
+        if t == TYPE_INT:
+            var after_crlf = crlf
+            var status: UInt8 = ST_OK
+            _ = _read_int(ptr, start + 1, crlf + 2, after_crlf, status)
+            if status == ST_INCOMPLETE:
+                return ScanResult(ST_INCOMPLETE, start)
+            if status == ST_PROTO_ERR:
+                return ScanResult(ST_PROTO_ERR, start)
+            return ScanResult(ST_OK, after_crlf)
+        return ScanResult(ST_OK, crlf + 2)
+    if t == TYPE_BULK:
+        var after_int = start + 1
+        var status: UInt8 = ST_OK
+        var blen = _read_int(ptr, start + 1, end, after_int, status)
+        if status == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status == ST_PROTO_ERR or blen < -1:
+            return ScanResult(ST_PROTO_ERR, start)
+        if blen == -1:
+            return ScanResult(ST_OK, after_int)
+        var pstart = after_int
+        if pstart + blen + 2 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        return ScanResult(ST_OK, pstart + blen + 2)
+    if t == TYPE_ARRAY or t == 62:  # '*' or '>'
+        var after_int = start + 1
+        var status: UInt8 = ST_OK
+        var count = _read_int(ptr, start + 1, end, after_int, status)
+        if status == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status == ST_PROTO_ERR or count < -1:
+            return ScanResult(ST_PROTO_ERR, start)
+        if count == -1:
+            return ScanResult(ST_OK, after_int)
+        if depth > MAX_DEPTH:
+            return ScanResult(ST_PROTO_ERR, start)
+        if count > (end - after_int) // 3:
+            return ScanResult(ST_INCOMPLETE, start)
+        var pos = after_int
+        for _i in range(count):
+            var child = _scan_node(ptr, pos, end, depth + 1)
+            if child.status == ST_PROTO_ERR:
+                return ScanResult(ST_PROTO_ERR, start)
+            if child.status == ST_INCOMPLETE:
+                return ScanResult(ST_INCOMPLETE, start)
+            pos = child.pos
+        return ScanResult(ST_OK, pos)
+    if t == 44:  # ',' double
+        var crlf = _find_crlf(ptr, start + 1, end)
+        if crlf < 0:
+            return ScanResult(ST_INCOMPLETE, start)
+        return ScanResult(ST_OK, crlf + 2)
+    if t == 35:  # '#' bool
+        if start + 4 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        var bval = ptr.unsafe_offset(start + 1)[]
+        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
+            return ScanResult(ST_PROTO_ERR, start)
+        if bval != 116 and bval != 102:
+            return ScanResult(ST_PROTO_ERR, start)
+        return ScanResult(ST_OK, start + 4)
+    if t == 95:  # '_' null
+        if start + 3 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
+            return ScanResult(ST_PROTO_ERR, start)
+        return ScanResult(ST_OK, start + 3)
+    if t == 61:  # '=' verbatim string
+        var after_int = start + 1
+        var status: UInt8 = ST_OK
+        var vlen = _read_int(ptr, start + 1, end, after_int, status)
+        if status == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status == ST_PROTO_ERR or vlen < 0:
+            return ScanResult(ST_PROTO_ERR, start)
+        var pstart = after_int
+        if pstart + vlen + 2 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        return ScanResult(ST_OK, pstart + vlen + 2)
+    if t == 126:  # '~' set
+        var after_int2 = start + 1
+        var status2: UInt8 = ST_OK
+        var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
+        if status2 == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status2 == ST_PROTO_ERR or count2 < 0:
+            return ScanResult(ST_PROTO_ERR, start)
+        if depth > MAX_DEPTH:
+            return ScanResult(ST_PROTO_ERR, start)
+        if count2 > (end - after_int2) // 3:
+            return ScanResult(ST_INCOMPLETE, start)
+        var spos = after_int2
+        for _i2 in range(count2):
+            var child2 = _scan_node(ptr, spos, end, depth + 1)
+            if child2.status == ST_PROTO_ERR:
+                return ScanResult(ST_PROTO_ERR, start)
+            if child2.status == ST_INCOMPLETE:
+                return ScanResult(ST_INCOMPLETE, start)
+            spos = child2.pos
+        return ScanResult(ST_OK, spos)
+    if t == 37:  # '%' map
+        var after_int3 = start + 1
+        var status3: UInt8 = ST_OK
+        var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
+        if status3 == ST_INCOMPLETE:
+            return ScanResult(ST_INCOMPLETE, start)
+        if status3 == ST_PROTO_ERR or pairs < 0:
+            return ScanResult(ST_PROTO_ERR, start)
+        if depth > MAX_DEPTH:
+            return ScanResult(ST_PROTO_ERR, start)
+        if pairs > (end - after_int3) // 6:
+            return ScanResult(ST_INCOMPLETE, start)
+        var mpos = after_int3
+        for _i3 in range(pairs):
+            var key_node = _scan_node(ptr, mpos, end, depth + 1)
+            if key_node.status == ST_PROTO_ERR:
+                return ScanResult(ST_PROTO_ERR, start)
+            if key_node.status == ST_INCOMPLETE:
+                return ScanResult(ST_INCOMPLETE, start)
+            mpos = key_node.pos
+            var val_node = _scan_node(ptr, mpos, end, depth + 1)
+            if val_node.status == ST_PROTO_ERR:
+                return ScanResult(ST_PROTO_ERR, start)
+            if val_node.status == ST_INCOMPLETE:
+                return ScanResult(ST_INCOMPLETE, start)
+            mpos = val_node.pos
+        return ScanResult(ST_OK, mpos)
+    # unknown type byte: let the builder produce the exact error text
+    return ScanResult(ST_PROTO_ERR, start)
 
 
 def _parse_node(
