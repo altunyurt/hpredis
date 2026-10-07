@@ -202,7 +202,10 @@ def _drain_chunked(payload, chunk, use_gets=False):
 @pytest.mark.parametrize("chunk", [1, 2, 3, 7, 64, 4096, 65536])
 @pytest.mark.parametrize("use_gets", [False, True])
 def test_chunked_feeding_matches_single_feed(chunk, use_gets):
-    payload = (b"*5\r\n$3\r\nfoo\r\n:42\r\n+bar\r\n$0\r\n\r\n-ERR x\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n") * 20
+    payload = (
+        b"*7\r\n$3\r\nfoo\r\n:42\r\n+bar\r\n$0\r\n\r\n$-1\r\n-ERR x\r\n"
+        b"*3\r\n$1\r\na\r\n:7\r\n$1\r\nb\r\n"
+    ) * 20
     one = hpredis.Reader()
     one.feed(payload)
     want = one.drain(False)

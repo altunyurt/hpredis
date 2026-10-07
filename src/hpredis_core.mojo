@@ -799,6 +799,64 @@ def _parse_node(
         var pos = after_int
         var saw_err = False
         for i in range(count):
+            # inline scalar fast path: arrays of strings/ints are the common
+            # real reply (MGET/LRANGE/HGETALL/SMEMBERS).  A recursive
+            # _parse_node call plus its Node costs ~20ns per element
+            # (measured), and most elements are one of these three types.
+            var t2 = ptr.unsafe_offset(pos)[]
+            if t2 == TYPE_BULK:
+                var after2 = pos + 1
+                var st2: UInt8 = ST_OK
+                var blen2 = _read_int(ptr, pos + 1, end, after2, st2)
+                if st2 == ST_INCOMPLETE:
+                    _ = cpy.Py_DecRef(list_obj)
+                    return _incomplete_node(start)
+                if st2 == ST_PROTO_ERR:
+                    _ = cpy.Py_DecRef(list_obj)
+                    return _proto_node(start, "Bad bulk string length")
+                if blen2 < -1:
+                    _ = cpy.Py_DecRef(list_obj)
+                    return _proto_node(start, "Bulk string length out of range")
+                if blen2 == -1:
+                    _ = cpy.PyList_SetItem(list_obj, i, _none_payload())
+                    pos = after2
+                else:
+                    if after2 + blen2 + 2 > end:
+                        _ = cpy.Py_DecRef(list_obj)
+                        return _incomplete_node(start)
+                    _ = cpy.PyList_SetItem(list_obj, i, _leaf_payload(ptr, after2, blen2, cnv))
+                    pos = after2 + blen2 + 2
+                continue
+            if t2 == TYPE_INT:
+                var after2 = pos + 1
+                var st2: UInt8 = ST_OK
+                var value2 = _read_int(ptr, pos + 1, end, after2, st2)
+                if st2 == ST_INCOMPLETE:
+                    _ = cpy.Py_DecRef(list_obj)
+                    return _incomplete_node(start)
+                if st2 == ST_PROTO_ERR:
+                    _ = cpy.Py_DecRef(list_obj)
+                    return _proto_node(start, "Bad integer value")
+                _ = cpy.PyList_SetItem(list_obj, i, cpy.PyLong_FromSsize_t(value2))
+                pos = after2
+                continue
+            if t2 == TYPE_SIMPLE or t2 == TYPE_ERROR:
+                var crlf2 = _find_crlf(ptr, pos + 1, end)
+                if crlf2 < 0:
+                    _ = cpy.Py_DecRef(list_obj)
+                    return _incomplete_node(start)
+                var pstart2 = pos + 1
+                if t2 == TYPE_ERROR:
+                    _ = cpy.PyList_SetItem(
+                        list_obj, i,
+                        _error_marker(ptr.unsafe_offset(pstart2), crlf2 - pstart2))
+                    saw_err = True
+                else:
+                    _ = cpy.PyList_SetItem(
+                        list_obj, i,
+                        _leaf_payload(ptr, pstart2, crlf2 - pstart2, cnv))
+                pos = crlf2 + 2
+                continue
             var child = _parse_node(ptr, pos, end, depth + 1, cnv)
             if child.status == ST_INCOMPLETE:
                 _ = cpy.Py_DecRef(list_obj)
