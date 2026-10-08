@@ -99,6 +99,7 @@ struct Reader(Defaultable, Movable, Writable):
     var dec_errors: Int
     # the wrapper's replyError callable, cached once (see set_reply_error)
     var reply_error: Int
+    var reply_error_weak: Bool
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
     # ponytail: resume between top-level collection children; an incomplete
@@ -122,6 +123,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.dec_encoding = 0
         self.dec_errors = 0
         self.reply_error = 0
+        self.reply_error_weak = False
         self.needs_scan = False
         self.scan_active = False
         self.scan_pos = 0
@@ -182,18 +184,20 @@ struct Reader(Defaultable, Movable, Writable):
 
     @staticmethod
     def set_reply_error(
-        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], reply_error: PythonObject
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin],
+        reply_error: PythonObject,
+        is_weak: PythonObject,
     ) raises -> PythonObject:
-        """Cache a zero-arg getter for the wrapper's replyError callable.
+        """Cache the wrapper's replyError factory once per Reader.
 
-        drain() used to steal the argument on every call, leaking one
-        reference to the callable per batch (measured +100 after 100 drains).
-        The wrapper passes a weakref getter so the Reader stays collectable.
+        Classes are stored directly (is_weak false); anything else is a
+        zero-arg weakref getter, so reader/callable cycles stay collectable.
         """
         ref cpy = Python().cpython()
         if self_ptr[].reply_error != 0:
             _ = cpy.Py_DecRef(_int_ptr(self_ptr[].reply_error))
         self_ptr[].reply_error = Int(reply_error.steal_data())
+        self_ptr[].reply_error_weak = Int(py=is_weak) != 0
         return PythonObject(0)
 
     @staticmethod
@@ -216,6 +220,37 @@ struct Reader(Defaultable, Movable, Writable):
             # rebuilt from scratch on every chunk)
             if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
                 return _status_tuple(ST_INCOMPLETE, _none_payload())
+        if ptr.unsafe_offset(self_ptr[].consumed)[] == 45 and self_ptr[].reply_error != 0:
+            # top-level error replies are the hottest non-clean path: call the
+            # replyError factory straight from C like hiredis does, instead of
+            # building a marker tuple and a second status tuple
+            var crlf = _find_crlf(ptr, self_ptr[].consumed + 1, self_ptr[].buf_len)
+            if crlf < 0:
+                self_ptr[].needs_scan = True
+                return _status_tuple(ST_INCOMPLETE, _none_payload())
+            var msg_start = self_ptr[].consumed + 1
+            var msg_len = crlf - msg_start
+            var inst = _error_to_instance(
+                self_ptr[].reply_error, self_ptr[].reply_error_weak,
+                ptr.unsafe_offset(msg_start), msg_len)
+            if inst != 0:
+                self_ptr[].consumed = crlf + 2
+                self_ptr[].needs_scan = False
+                _ = _compact(self_ptr[])
+                return PythonObject(from_owned=PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+                    unsafe_from_address=inst)))
+            if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+                # the factory raised: consume the reply and let the pending
+                # CPython exception propagate with its original traceback
+                self_ptr[].consumed = crlf + 2
+                self_ptr[].needs_scan = False
+                return PythonObject(from_owned=PyObjectPtr())
+            # dead getter: hand the marker to the wrapper's finalizer instead
+            var marker = _error_marker(ptr.unsafe_offset(msg_start), msg_len)
+            self_ptr[].consumed = crlf + 2
+            self_ptr[].needs_scan = False
+            _ = _compact(self_ptr[])
+            return _status_tuple(ST_REPLY_ERR, marker)
         var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
         if node.status == ST_INCOMPLETE:
             self_ptr[].needs_scan = True
@@ -249,9 +284,11 @@ struct Reader(Defaultable, Movable, Writable):
     def prefetch_clean(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
         """Batch clean scalar replies; return a lone reply directly.
 
-        Containers/errors remain for try_gets. The caller uses this only when
-        decoding is disabled. Batched replies include wire lengths so the
-        wrapper can preserve len() while holding its bounded queue.
+        Containers stay for try_gets.  Error replies are batched too when the
+        cached factory is a class (no raise path), so error-heavy streams pay
+        one core call per batch instead of one per reply; a custom/raising
+        callable stays special.  Used only when decoding is disabled.  Batched
+        replies include wire lengths so the wrapper can preserve len().
         """
         var collected = List[PyObjectPtr]()
         var lengths = List[PyObjectPtr]()
@@ -284,21 +321,47 @@ struct Reader(Defaultable, Movable, Writable):
                     break
             var pos = self_ptr[].consumed
             var t = ptr.unsafe_offset(pos)[]
-            # Containers and pushes have wrapper-specific finalization.
-            if t == TYPE_ARRAY or t == TYPE_ERROR or t == 62 or t == 37 or t == 126:
-                special = True
-                break
-            var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
-            if node.status == ST_INCOMPLETE:
-                self_ptr[].needs_scan = True
-                break
-            self_ptr[].needs_scan = False
-            if node.status != ST_OK or node.had_err or cnv.failed:
-                special = True
-                break
-            var wire_len = node.pos - pos
-            self_ptr[].consumed = node.pos
-            var payload = node.payload.steal_data()
+            var payload = PyObjectPtr()
+            var wire_len = 0
+            if t == TYPE_ERROR:
+                # classes never raise from construction; batch them so
+                # error-heavy streams pay one core call per batch
+                if self_ptr[].reply_error == 0 or self_ptr[].reply_error_weak:
+                    special = True
+                    break
+                var crlf = _find_crlf(ptr, pos + 1, self_ptr[].buf_len)
+                if crlf < 0:
+                    self_ptr[].needs_scan = True
+                    break
+                self_ptr[].needs_scan = False
+                var inst = _error_to_instance(
+                    self_ptr[].reply_error, False, ptr.unsafe_offset(pos + 1),
+                    crlf - (pos + 1))
+                if inst == 0:
+                    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+                        _ = cpy.PyErr_Clear()
+                    special = True
+                    break
+                payload = PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+                    unsafe_from_address=inst))
+                wire_len = crlf + 2 - pos
+                self_ptr[].consumed = crlf + 2
+            else:
+                # Containers and pushes have wrapper-specific finalization.
+                if t == TYPE_ARRAY or t == 62 or t == 37 or t == 126:
+                    special = True
+                    break
+                var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
+                if node.status == ST_INCOMPLETE:
+                    self_ptr[].needs_scan = True
+                    break
+                self_ptr[].needs_scan = False
+                if node.status != ST_OK or node.had_err or cnv.failed:
+                    special = True
+                    break
+                wire_len = node.pos - pos
+                self_ptr[].consumed = node.pos
+                payload = node.payload.steal_data()
             if reply_count == 0:
                 first_payload = payload
                 first_length = wire_len
@@ -400,7 +463,7 @@ struct Reader(Defaultable, Movable, Writable):
                 if node.status == ST_REPLY_ERR and re_ptr != 0:
                     var marker = Int(node.payload.steal_data())
                     var callback_error = PyObjectPtr()
-                    var inst = _marker_to_instance(re_ptr, marker, callback_error)
+                    var inst = _marker_to_instance(re_ptr, self_ptr[].reply_error_weak, marker, callback_error)
                     if inst != 0:
                         self_ptr[].consumed = node.pos
                         collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
@@ -792,7 +855,7 @@ def _list_of(imm collected: List[PyObjectPtr]) raises -> PyObjectPtr:
     return lst
 
 
-def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -> Int:
+def _marker_to_instance(re_ptr: Int, weak: Bool, marker_ptr: Int, mut raised: PyObjectPtr) -> Int:
     """Turn an error marker tuple into a replyError instance in the core.
 
     Returns 0 and stores the raised exception in `raised` when the callable
@@ -800,27 +863,24 @@ def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -
     preserving the original exception and traceback for the Python wrapper.
     """
     ref cpy = Python().cpython()
-    # re_ptr holds a zero-arg weakref getter (see set_reply_error): the core
-    # must not keep the wrapper's callable alive, or reader/callable cycles
-    # become invisible to the cyclic GC (the Mojo type has no tp_traverse)
-    var callable = external_call["PyObject_CallNoArgs", PyObjectPtr](
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr))
-    if Int(callable) == 0:
-        raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
-        return 0
-    if Int(callable) == Int(cpy.Py_None()):
-        # dead weakref: drain falls back to the wrapper's own callable
-        _ = cpy.Py_DecRef(callable)
-        return 0
     var msg = external_call["PyTuple_GetItem", PyObjectPtr](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker_ptr), c_ssize_t(1))
     if Int(msg) == 0:
-        _ = cpy.Py_DecRef(callable)
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
     # hiredis hands error text over as str, always (utf-8/"replace")
     var bp = external_call["PyBytes_AsString", Pointer[UInt8, MutAnyOrigin]](msg)
     var bn = Int(external_call["PyBytes_Size", c_ssize_t](msg))
+    var owned = False
+    var callable = _resolve_reply_error(re_ptr, weak, owned)
+    if Int(callable) == 0:
+        raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
+        return 0
+    if Int(callable) == Int(cpy.Py_None()):
+        # dead weakref: drain falls back to the wrapper's own callable
+        if owned:
+            _ = cpy.Py_DecRef(callable)
+        return 0
     var enc = String("utf-8")
     var errs = String("replace")
     var text = external_call["PyUnicode_Decode", PyObjectPtr](
@@ -828,25 +888,75 @@ def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(enc.unsafe_ptr())),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(errs.unsafe_ptr())))
     if Int(text) == 0:
-        _ = cpy.Py_DecRef(callable)
+        if owned:
+            _ = cpy.Py_DecRef(callable)
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
-    var args = cpy.PyTuple_New(1)
-    if Int(args) == 0:
-        _ = cpy.Py_DecRef(text)
-        _ = cpy.Py_DecRef(callable)
-        raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
-        return 0
-    _ = cpy.PyTuple_SetItem(args, 0, text)
-    var inst = external_call["PyObject_CallObject", PyObjectPtr](
+    var inst = external_call["PyObject_CallOneArg", PyObjectPtr](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(callable)),
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(args)))
-    _ = cpy.Py_DecRef(callable)
-    _ = cpy.Py_DecRef(args)
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(text)))
+    _ = cpy.Py_DecRef(text)
+    if owned:
+        _ = cpy.Py_DecRef(callable)
     if Int(inst) == 0:
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
     return Int(inst)
+
+def _resolve_reply_error(re_ptr: Int, weak: Bool, mut owned: Bool) -> PyObjectPtr:
+    """Resolve the cached replyError factory.
+
+    Classes are cached strongly (no GC cycle is possible); anything else is a
+    zero-arg weakref getter.  `owned` says whether the caller must Py_DecRef
+    the result.
+    """
+    if not weak:
+        owned = False
+        return _int_ptr(re_ptr)
+    owned = True
+    return external_call["PyObject_CallNoArgs", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr))
+
+
+def _error_to_instance(
+    re_ptr: Int, weak: Bool, msg_ptr: Pointer[UInt8, MutAnyOrigin], msg_len: Int
+) -> Int:
+    """Build a replyError instance straight from the error line bytes.
+
+    Decodes utf-8/"replace" like hiredis and calls the factory once; no marker
+    tuple, sentinel bytes or status tuple are allocated.  Returns 0 with the
+    CPython exception left pending when the factory or a C call failed, so the
+    caller can propagate it directly with its traceback.
+    """
+    ref cpy = Python().cpython()
+    var enc = String("utf-8")
+    var errs = String("replace")
+    var text = external_call["PyUnicode_Decode", PyObjectPtr](
+        msg_ptr, c_ssize_t(msg_len),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(enc.unsafe_ptr())),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(errs.unsafe_ptr())))
+    if Int(text) == 0:
+        return 0
+    var owned = False
+    var callable = _resolve_reply_error(re_ptr, weak, owned)
+    if Int(callable) == 0:
+        _ = cpy.Py_DecRef(text)
+        return 0
+    if Int(callable) == Int(cpy.Py_None()):
+        _ = cpy.Py_DecRef(text)
+        if owned:
+            _ = cpy.Py_DecRef(callable)
+        return 0
+    var inst = external_call["PyObject_CallOneArg", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(callable)),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(text)))
+    _ = cpy.Py_DecRef(text)
+    if owned:
+        _ = cpy.Py_DecRef(callable)
+    if Int(inst) == 0:
+        return 0
+    return Int(inst)
+
 
 def _push_marker(payload: PyObjectPtr) raises -> PyObjectPtr:
     """Nested push reply → (sentinel_bytes, payload); the wrapper wraps it."""

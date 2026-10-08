@@ -55,6 +55,8 @@ class Reader:
     ):
         self._core = _core.Reader()
         self._feed = self._core.feed
+        self._prefetch = self._core.prefetch_clean
+        self._try_gets = self._core.try_gets
         self._pending = []
         self._pending_lengths = []
         self._pending_index = 0
@@ -80,18 +82,28 @@ class Reader:
         # before the next feed(), so gets()/has_data() can answer without a
         # core call (redis-py polls both between reads)
         self._exhausted = True
+        # a non-clean reply head was seen: skip the prefetch probe until a
+        # clean reply or the next feed (error-heavy streams otherwise pay a
+        # wasted core call per reply)
+        self._special = False
         self._sync_decoding()
         re = self._replyError
-        if getattr(re, "__self__", None) is not None:
-            re_get = weakref.WeakMethod(re)
+        if isinstance(re, type):
+            # classes are safe to cache strongly; a strong cache of a bound
+            # method or closure would keep reader/callable cycles alive
+            self._reply_get = re
+            self._core.set_reply_error(re, False)
         else:
-            try:
-                re_get = weakref.ref(re)
-            except TypeError:
-                # callables without weakref support: keep a strong proxy
-                re_get = lambda: re
-        self._reply_get = re_get
-        self._core.set_reply_error(re_get)
+            if getattr(re, "__self__", None) is not None:
+                re_get = weakref.WeakMethod(re)
+            else:
+                try:
+                    re_get = weakref.ref(re)
+                except TypeError:
+                    # callables without weakref support: strong proxy getter
+                    re_get = lambda: re
+            self._reply_get = re_get
+            self._core.set_reply_error(re_get, True)
 
     def feed(self, data, start=None, stop=None):
         """Feed any buffer-protocol object; (start, stop) is a hiredis-style
@@ -117,6 +129,7 @@ class Reader:
         if self._feed(data) != 0:
             raise TypeError("a bytes-like object is required")
         self._exhausted = False
+        self._special = False
         self._closed = False
 
     def gets(self, should_decode=True):
@@ -127,8 +140,12 @@ class Reader:
             return self._highway_gets()
         if self._exhausted and self._pending_index >= self._pending_count:
             return self._notEnoughData
-        if self._pending_index >= self._pending_count and self._encoding is None:
-            prefetched = self._core.prefetch_clean()
+        if (
+            self._pending_index >= self._pending_count
+            and self._encoding is None
+            and not self._special
+        ):
+            prefetched = self._prefetch()
             if type(prefetched) is not tuple:
                 return prefetched
             if len(prefetched) == 3:
@@ -138,6 +155,8 @@ class Reader:
             elif prefetched[0] == 1:
                 self._exhausted = True
                 return self._notEnoughData
+            else:
+                self._special = True
         if self._pending_index < self._pending_count:
             index = self._pending_index
             reply = self._pending[index]
@@ -147,7 +166,10 @@ class Reader:
             if self._encoding is not None and should_decode:
                 return self._finalize(reply, should_decode)
             return reply
-        result = self._core.try_gets(1 if should_decode else 0)
+        result = self._try_gets(1 if should_decode else 0)
+        if type(result) is not tuple:
+            self._special = False
+            return result
         return self._handle_gets_result(result, should_decode)
 
     def _handle_gets_result(self, result, should_decode):

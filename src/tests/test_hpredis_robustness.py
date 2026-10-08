@@ -52,6 +52,17 @@ def _tracemalloc_growth(fn, iterations):
     return sum(s.size_diff for s in after.compare_to(before, "filename"))
 
 
+def test_error_replies_batch_like_scalars():
+    r = hpredis.Reader()
+    r.feed(b"-ERR one\r\n-ERR two\r\n")
+    first = r.gets()
+    assert isinstance(first, hpredis.ReplyError) and first.args[0] == "ERR one"
+    # the batch consumed both replies in one core call
+    assert r._core.buffered() == 0
+    second = r.gets()
+    assert isinstance(second, hpredis.ReplyError) and second.args[0] == "ERR two"
+
+
 def test_error_replies_do_not_leak():
     r = reader()
 
