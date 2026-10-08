@@ -41,6 +41,8 @@ comptime PREFETCH_MAX_BYTES = 65536
 
 # nested error marker sentinel (tuple[0]); unique, never valid RESP data
 comptime ERR_SENTINEL = "\x00hpredis-error\x00"
+# nested push reply sentinel; the wrapper rebuilds a PushNotification
+comptime PUSH_SENTINEL = "\x00hpredis-push\x00"
 
 
 struct ResponseSlice(Movable, ImplicitlyCopyable, Writable):
@@ -65,8 +67,8 @@ struct Node(Movable):
     var pos: Int
     var payload: PythonObject
     var err_msg: String
-    # True when the node or any nested node is an error reply (marker tuple);
-    # drain() uses it to skip per-reply Python finalization for clean batches
+    # True when the wrapper must finalize the payload: a nested error reply
+    # or a nested push (both carry marker tuples)
     var had_err: Bool
 
     def __init__(out self, status: UInt8, pos: Int, payload: PythonObject):
@@ -139,7 +141,8 @@ struct Reader(Defaultable, Movable, Writable):
             raw, Pointer(to=view), c_int(0))  # PyBUF_SIMPLE
         if rc != 0:
             _ = cpy.Py_DecRef(raw)
-            raise Error("feed() expects a buffer-protocol object")
+            _ = cpy.PyErr_Clear()  # the wrapper raises TypeError
+            return PythonObject(1)
         var n = Int(view.len)
         if n > 0:
             if _arena_pinned(self_ptr[]):
@@ -376,12 +379,18 @@ struct Reader(Defaultable, Movable, Writable):
                     break
                 self_ptr[].needs_scan = False
                 if node.status == ST_DICT_ERR:
+                    if len(collected) > 0:
+                        # deliver what parsed; the next drain()/gets() raises
+                        break
                     # unhashable map key: consumed; the wrapper raises TypeError
                     self_ptr[].consumed = node.pos
                     _ = _compact(self_ptr[])
                     return _drain_result(
                         _list_of(collected), _none_payload(), True, True, cnv.failed, _none_payload())
                 if node.status == ST_PROTO_ERR:
+                    if len(collected) > 0:
+                        # leave it pending for the next drain()/gets()
+                        break
                     # sticky and not consumed (matches gets)
                     self_ptr[].proto_err = True
                     self_ptr[].proto_err_msg = node.err_msg
@@ -389,19 +398,28 @@ struct Reader(Defaultable, Movable, Writable):
                     return _drain_result(
                         _list_of(collected), _bytes_payload(node.err_msg), False, False, cnv.failed, _none_payload())
                 if node.status == ST_REPLY_ERR and re_ptr != 0:
-                    self_ptr[].consumed = node.pos
                     var marker = Int(node.payload.steal_data())
                     var callback_error = PyObjectPtr()
                     var inst = _marker_to_instance(re_ptr, marker, callback_error)
                     if inst != 0:
+                        self_ptr[].consumed = node.pos
                         collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
                             unsafe_from_address=inst)))
                         _ = external_call["Py_DecRef", NoneType](
                             Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker))
                         continue
                     if Int(callback_error) != 0:
+                        if len(collected) > 0:
+                            # deliver the replies parsed so far; the next
+                            # drain()/gets() raises on this error reply
+                            _ = external_call["Py_DecRef", NoneType](
+                                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(callback_error)))
+                            _ = external_call["Py_DecRef", NoneType](
+                                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker))
+                            break
                         # Preserve the exception from the one callback invocation;
                         # the wrapper raises this object without calling again.
+                        self_ptr[].consumed = node.pos
                         raise_exc = callback_error
                         _ = external_call["Py_DecRef", NoneType](
                             Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker))
@@ -412,12 +430,22 @@ struct Reader(Defaultable, Movable, Writable):
                     collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
                         unsafe_from_address=marker)))
                     continue
-                if node.status == ST_OK and node.had_err:
-                    # nested markers (e.g. an array holding an error) still need
-                    # the wrapper's walk
+                if cnv.failed:
+                    if len(collected) > 0:
+                        # stop before the reply whose leaf failed to decode
+                        cnv.failed = False
+                        break
+                    self_ptr[].consumed = node.pos
+                    collected.append(node.payload.steal_data())
+                    break
+                if (node.status == ST_OK and node.had_err) or node.status == ST_PUSH:
+                    # nested markers/pushes still need the wrapper's walk
                     had_markers = True
                 self_ptr[].consumed = node.pos
-                collected.append(node.payload.steal_data())
+                if node.status == ST_PUSH:
+                    collected.append(_push_marker(node.payload.steal_data()))
+                else:
+                    collected.append(node.payload.steal_data())
             # compact once for the whole batch (gets compacts per reply)
             _ = _compact(self_ptr[])
             return _drain_result(
@@ -820,6 +848,15 @@ def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -
         return 0
     return Int(inst)
 
+def _push_marker(payload: PyObjectPtr) raises -> PyObjectPtr:
+    """Nested push reply → (sentinel_bytes, payload); the wrapper wraps it."""
+    ref cpy = Python().cpython()
+    var t = cpy.PyTuple_New(2)
+    _ = cpy.PyTuple_SetItem(t, 0, _bytes_payload(String(PUSH_SENTINEL)))
+    _ = cpy.PyTuple_SetItem(t, 1, payload)
+    return t
+
+
 def _error_marker(msg_ptr: Pointer[UInt8, MutAnyOrigin], length: Int) raises -> PyObjectPtr:
     """Nested error reply → (sentinel_bytes, message_bytes)."""
     ref cpy = Python().cpython()
@@ -831,6 +868,45 @@ def _error_marker(msg_ptr: Pointer[UInt8, MutAnyOrigin], length: Int) raises -> 
 
 
 # === RESP parsing ===
+
+def _bool_ok(bval: Int) -> Bool:
+    """hiredis accepts t/f case-insensitively (#t/#T/#f/#F)."""
+    return bval == 116 or bval == 102 or bval == 84 or bval == 70
+
+
+def _is_inf_or_nan(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
+    """Exactly inf/nan, case-insensitive (hiredis rejects 'infinity')."""
+    if crlf - start != 3:
+        return False
+    var a = Int(ptr.unsafe_offset(start)[]) | 32
+    var b = Int(ptr.unsafe_offset(start + 1)[]) | 32
+    var c = Int(ptr.unsafe_offset(start + 2)[]) | 32
+    if a == 105 and b == 110 and c == 102:  # inf
+        return True
+    return a == 110 and b == 97 and c == 110  # nan
+
+
+def _double_chars_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
+    """hiredis' double grammar: optional '-', then digits/'.'/exponent
+    characters, or exactly inf/nan.  Leading '+', hex floats and underscores
+    are rejected before strtod runs (verified against hiredis 3.4.2)."""
+    var i = start
+    if i < crlf and ptr.unsafe_offset(i)[] == 45:  # '-'
+        i += 1
+    if i >= crlf:
+        return False
+    if _is_inf_or_nan(ptr, i, crlf):
+        return True
+    var first = Int(ptr.unsafe_offset(i)[])
+    if not (48 <= first <= 57 or first == 46):
+        return False
+    while i < crlf:
+        var ch = Int(ptr.unsafe_offset(i)[])
+        if not (48 <= ch <= 57 or ch == 46 or ch == 101 or ch == 69 or ch == 43 or ch == 45):
+            return False
+        i += 1
+    return True
+
 
 def _bignum_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
     """hiredis accepts an optional '-' followed by at least one digit."""
@@ -874,6 +950,41 @@ def _read_int(
         status = ST_INCOMPLETE
         return 0
     return _parse_int_line(ptr, start, crlf, out_end, status)
+
+
+def _read_len_fast(
+    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, mut out_end: Int, mut status: UInt8
+) -> Int:
+    """Positive length header in one pass (digits until CRLF, no memchr).
+
+    Falls back to the verified strict parser for '-', leading zeros, junk and
+    overflow, so semantics are unchanged for every non-hot input.
+    """
+    if start < end:
+        var first = Int(ptr.unsafe_offset(start)[])
+        if 49 <= first <= 57:
+            var value = UInt64(first - 48)
+            var i = start + 1
+            while i < end:
+                var d = Int(ptr.unsafe_offset(i)[])
+                if d == 13:
+                    if i + 1 >= end:
+                        break
+                    if ptr.unsafe_offset(i + 1)[] != 10:
+                        break
+                    out_end = i + 2
+                    status = ST_OK
+                    return Int(value)
+                if not (48 <= d <= 57):
+                    break
+                if value > 1844674407370955161:
+                    break
+                value *= 10
+                if value > 18446744073709551615 - UInt64(d - 48):
+                    break
+                value += UInt64(d - 48)
+                i += 1
+    return _read_int(ptr, start, end, out_end, status)
 
 
 def _parse_int_line(
@@ -947,6 +1058,8 @@ def _incomplete_node(pos: Int) raises -> Node:
 
 # hiredis caps nesting at 1024 containers and reports this exact message
 comptime MAX_DEPTH = 1024
+# hiredis rejects container counts above UINT32_MAX (measured 3.4.2)
+comptime MAX_CONTAINER_ELEMENTS = 4294967295
 
 
 struct ScanResult(ImplicitlyCopyable):
@@ -995,7 +1108,7 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
     if t == TYPE_BULK:
         var after_int = start + 1
         var status: UInt8 = ST_OK
-        var blen = _read_int(ptr, start + 1, end, after_int, status)
+        var blen = _read_len_fast(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR or blen < -1:
@@ -1020,6 +1133,8 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
+            return ScanResult(ST_PROTO_ERR, start)
+        if count > MAX_CONTAINER_ELEMENTS:
             return ScanResult(ST_PROTO_ERR, start)
         if t == 124:
             if count < 0:
@@ -1048,12 +1163,14 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
             return ScanResult(ST_INCOMPLETE, start)
         return ScanResult(ST_OK, crlf + 2)
     if t == 35:  # '#' bool
-        if start + 4 > end:
+        if start + 2 > end:
             return ScanResult(ST_INCOMPLETE, start)
         var bval = ptr.unsafe_offset(start + 1)[]
-        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
+        if not _bool_ok(Int(bval)):
             return ScanResult(ST_PROTO_ERR, start)
-        if bval != 116 and bval != 102:
+        if start + 4 > end:
+            return ScanResult(ST_INCOMPLETE, start)
+        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
             return ScanResult(ST_PROTO_ERR, start)
         return ScanResult(ST_OK, start + 4)
     if t == 95:  # '_' null
@@ -1082,6 +1199,8 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
             return ScanResult(ST_INCOMPLETE, start)
         if status2 == ST_PROTO_ERR or count2 < 0:
             return ScanResult(ST_PROTO_ERR, start)
+        if count2 > MAX_CONTAINER_ELEMENTS:
+            return ScanResult(ST_PROTO_ERR, start)
         if depth > MAX_DEPTH:
             return ScanResult(ST_PROTO_ERR, start)
         if count2 > (end - after_int2) // 3:
@@ -1102,6 +1221,8 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
         if status3 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status3 == ST_PROTO_ERR or pairs < 0:
+            return ScanResult(ST_PROTO_ERR, start)
+        if pairs > MAX_CONTAINER_ELEMENTS:
             return ScanResult(ST_PROTO_ERR, start)
         if depth > MAX_DEPTH:
             return ScanResult(ST_PROTO_ERR, start)
@@ -1211,7 +1332,7 @@ def _parse_node(
     if t == TYPE_BULK:
         var after_int = start + 1
         var status: UInt8 = ST_OK
-        var blen = _read_int(ptr, start + 1, end, after_int, status)
+        var blen = _read_len_fast(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status == ST_PROTO_ERR:
@@ -1241,6 +1362,8 @@ def _parse_node(
             return _incomplete_node(start)
         if status == ST_PROTO_ERR:
             return _proto_node(start, "Bad multi-bulk length")
+        if count > MAX_CONTAINER_ELEMENTS:
+            return _proto_node(start, "Multi-bulk length out of range")
         if t == 124:
             # attributes flatten N key/value pairs into one list (hiredis-py)
             if count < 0:
@@ -1272,7 +1395,7 @@ def _parse_node(
             if t2 == TYPE_BULK:
                 var after2 = pos + 1
                 var st2: UInt8 = ST_OK
-                var blen2 = _read_int(ptr, pos + 1, end, after2, st2)
+                var blen2 = _read_len_fast(ptr, pos + 1, end, after2, st2)
                 if st2 == ST_INCOMPLETE:
                     _ = cpy.Py_DecRef(list_obj)
                     return _incomplete_node(start)
@@ -1334,7 +1457,12 @@ def _parse_node(
                 return child^
             if child.had_err:
                 saw_err = True
-            _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
+            if child.status == ST_PUSH:
+                # nested push: tag for the wrapper's PushNotification walk
+                saw_err = True
+                _ = cpy.PyList_SetItem(list_obj, i, _push_marker(child.payload.steal_data()))
+            else:
+                _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
             pos = child.pos
         var out_status: UInt8 = ST_PUSH if t == 62 else ST_OK
         var out_node = Node(out_status, pos, PythonObject(from_owned=list_obj))
@@ -1344,22 +1472,36 @@ def _parse_node(
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return _incomplete_node(start)
-        # strtod-exact: let CPython parse the text (float(pybytes))
-        var text = PythonObject(from_owned=_bytes_slice_payload(ptr, start + 1, crlf - (start + 1)))
-        var f = Float64(py=Python.float(text))
-        return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(f)))
+        var pstart = start + 1
+        if crlf - pstart >= 326:  # hiredis char buf[326]
+            return _proto_node(start, "Double value is too large")
+        if not _double_chars_ok(ptr, pstart, crlf):
+            return _proto_node(start, "Bad double value")
+        # borrow the CRLF byte as strtod's NUL terminator, then restore it
+        ptr.unsafe_offset(crlf)[] = 0
+        var errno_ptr = external_call["__errno_location", Pointer[c_int, MutAnyOrigin]]()
+        errno_ptr[] = 0
+        var endp = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(ptr) + crlf)
+        var dval = external_call["strtod", Float64](ptr.unsafe_offset(pstart), Pointer(to=endp))
+        var err = errno_ptr[]  # ERANGE == 34: overflow and underflow both fail
+        ptr.unsafe_offset(crlf)[] = 13
+        if Int(endp) != Int(ptr) + crlf or err == 34:
+            return _proto_node(start, "Bad double value")
+        return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(dval)))
     if t == 35:  # '#' bool: #t\r\n / #f\r\n
-        if start + 4 > end:
+        if start + 2 > end:
             return _incomplete_node(start)
         var bval = ptr.unsafe_offset(start + 1)[]
+        if not _bool_ok(Int(bval)):
+            return _proto_node(start, "Bad bool value")
+        if start + 4 > end:
+            return _incomplete_node(start)
         if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
-            return _proto_node(start, "Protocol error: invalid bool reply")
+            return _proto_node(start, "Bad bool value")
         ref cpy2 = Python().cpython()
-        if bval == 116:
+        if bval == 116 or bval == 84:
             return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(1)))
-        if bval == 102:
-            return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(0)))
-        return _proto_node(start, "Protocol error: invalid bool reply")
+        return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(0)))
     if t == 95:  # '_' null
         if start + 3 > end:
             return _incomplete_node(start)
@@ -1392,6 +1534,8 @@ def _parse_node(
             return _incomplete_node(start)
         if status2 == ST_PROTO_ERR or count2 < 0:
             return _proto_node(start, "Bad set length")
+        if count2 > MAX_CONTAINER_ELEMENTS:
+            return _proto_node(start, "Multi-bulk length out of range")
         if depth > MAX_DEPTH:
             return _proto_node(start, "Max nesting depth exceeded")
         if count2 > (end - after_int2) // 3:
@@ -1413,7 +1557,11 @@ def _parse_node(
                 return child2^
             if child2.had_err:
                 saw_err2 = True
-            _ = cpy3.PyList_SetItem(set_list, i2, child2.payload.steal_data())
+            if child2.status == ST_PUSH:
+                saw_err2 = True
+                _ = cpy3.PyList_SetItem(set_list, i2, _push_marker(child2.payload.steal_data()))
+            else:
+                _ = cpy3.PyList_SetItem(set_list, i2, child2.payload.steal_data())
             spos = child2.pos
         var set_node = Node(ST_OK, spos, PythonObject(from_owned=set_list))
         set_node.had_err = saw_err2
@@ -1426,6 +1574,8 @@ def _parse_node(
             return _incomplete_node(start)
         if status3 == ST_PROTO_ERR or pairs < 0:
             return _proto_node(start, "Bad map length")
+        if pairs > MAX_CONTAINER_ELEMENTS:
+            return _proto_node(start, "Multi-bulk length out of range")
         if depth > MAX_DEPTH:
             return _proto_node(start, "Max nesting depth exceeded")
         if pairs > (end - after_int3) // 6:
@@ -1464,6 +1614,9 @@ def _parse_node(
             # PyDict_SetItem increfs, so release the refs we stole either way
             var kp = key_node.payload.steal_data()
             var vp = val_node.payload.steal_data()
+            if val_node.status == ST_PUSH:
+                saw_err3 = True
+                vp = _push_marker(vp)
             var rc = cpy4.PyDict_SetItem(dict_obj, kp, vp)
             _ = cpy4.Py_DecRef(kp)
             _ = cpy4.Py_DecRef(vp)
@@ -1545,7 +1698,7 @@ def _scan_highway(
     if t == TYPE_BULK:
         var after_int = start + 1
         var status: UInt8 = ST_OK
-        var blen = _read_int(ptr, start + 1, end, after_int, status)
+        var blen = _read_len_fast(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
@@ -1575,6 +1728,8 @@ def _scan_highway(
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
             return ScanResult(ST_PROTO_ERR, start, String("Bad multi-bulk length"))
+        if count > MAX_CONTAINER_ELEMENTS:
+            return ScanResult(ST_PROTO_ERR, start, String("Multi-bulk length out of range"))
         if t == 124:
             if count < 0:
                 return ScanResult(ST_PROTO_ERR, start, String("Bad attribute length"))
@@ -1602,6 +1757,8 @@ def _scan_highway(
             return ScanResult(ST_INCOMPLETE, start)
         if status2 == ST_PROTO_ERR or count2 < 0:
             return ScanResult(ST_PROTO_ERR, start, String("Bad set length"))
+        if count2 > MAX_CONTAINER_ELEMENTS:
+            return ScanResult(ST_PROTO_ERR, start, String("Multi-bulk length out of range"))
         if depth > MAX_DEPTH:
             return ScanResult(ST_PROTO_ERR, start, String("Max nesting depth exceeded"))
         if count2 > (end - after_int2) // 3:
@@ -1621,6 +1778,8 @@ def _scan_highway(
             return ScanResult(ST_INCOMPLETE, start)
         if status3 == ST_PROTO_ERR or pairs < 0:
             return ScanResult(ST_PROTO_ERR, start, String("Bad map length"))
+        if pairs > MAX_CONTAINER_ELEMENTS:
+            return ScanResult(ST_PROTO_ERR, start, String("Multi-bulk length out of range"))
         if depth > MAX_DEPTH:
             return ScanResult(ST_PROTO_ERR, start, String("Max nesting depth exceeded"))
         if pairs > (end - after_int3) // 6:
@@ -1656,13 +1815,15 @@ def _scan_highway(
         _record_slice(slices, vpos - base, vlen2, t)
         return ScanResult(ST_OK, pstart4 + vlen + 2)
     if t == 35:  # '#' bool
-        if start + 4 > end:
+        if start + 2 > end:
             return ScanResult(ST_INCOMPLETE, start)
         var bval = ptr.unsafe_offset(start + 1)[]
+        if not _bool_ok(Int(bval)):
+            return ScanResult(ST_PROTO_ERR, start, String("Bad bool value"))
+        if start + 4 > end:
+            return ScanResult(ST_INCOMPLETE, start)
         if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
-            return ScanResult(ST_PROTO_ERR, start, String("Protocol error: invalid bool reply"))
-        if bval != 116 and bval != 102:
-            return ScanResult(ST_PROTO_ERR, start, String("Protocol error: invalid bool reply"))
+            return ScanResult(ST_PROTO_ERR, start, String("Bad bool value"))
         return ScanResult(ST_OK, start + 4)
     if t == 95:  # '_' null
         if start + 3 > end:

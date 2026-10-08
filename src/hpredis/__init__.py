@@ -14,6 +14,7 @@ import weakref
 from . import hpredis_core as _core
 
 _ERR_SENTINEL = b"\x00hpredis-error\x00"
+_PUSH_SENTINEL = b"\x00hpredis-push\x00"
 
 __all__ = [
     "HiredisError",
@@ -53,6 +54,7 @@ class Reader:
         highway_mode=False,
     ):
         self._core = _core.Reader()
+        self._feed = self._core.feed
         self._pending = []
         self._pending_lengths = []
         self._pending_index = 0
@@ -92,12 +94,12 @@ class Reader:
         self._core.set_reply_error(re_get)
 
     def feed(self, data, start=None, stop=None):
-        """Feed bytes/bytearray/memoryview. (data, start, stop) slices a buffer."""
-        if not isinstance(data, (bytes, bytearray, memoryview)):
-            raise TypeError("feed() expects a buffer-protocol object")
+        """Feed any buffer-protocol object; (start, stop) is a hiredis-style
+        (offset, length) window."""
         if start is not None or stop is not None:
             # hiredis feed(data, start, length): third arg is a LENGTH
-            n = len(data)
+            view = memoryview(data)  # TypeError for non-buffer objects
+            n = len(view)
             if start is None:
                 start = 0
             if start < 0 or start > n:
@@ -109,10 +111,11 @@ class Reader:
             if start + stop > n:
                 raise ValueError("invalid length")
             if not (start == 0 and stop == n):
-                # whole-buffer feeds (redis-py: feed(buf, 0, n)) skip the
-                # memoryview objects entirely
-                data = memoryview(data)[start : start + stop]
-        self._core.feed(data)
+                # the whole-buffer case (redis-py: feed(buf, 0, n)) stays on
+                # the fast path and skips the memoryview object entirely
+                data = view[start : start + stop]
+        if self._feed(data) != 0:
+            raise TypeError("a bytes-like object is required")
         self._exhausted = False
         self._closed = False
 
@@ -312,6 +315,8 @@ class Reader:
     def _finalize(self, obj, should_decode):
         if isinstance(obj, tuple) and obj and obj[0] == _ERR_SENTINEL:
             return self._replyError(self._decode_msg(obj[1]))
+        if isinstance(obj, tuple) and obj and obj[0] == _PUSH_SENTINEL:
+            return PushNotification(self._finalize(obj[1], should_decode))
         if isinstance(obj, list):
             return [self._finalize(x, should_decode) for x in obj]
         if isinstance(obj, dict):

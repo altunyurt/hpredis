@@ -22,6 +22,16 @@ def reader(**kwargs):
 # --- reference leaks -------------------------------------------------------
 
 
+def test_feed_accepts_buffer_protocol_objects():
+    import array
+
+    r = hpredis.Reader()
+    r.feed(array.array("B", b"+OK\r\n"))
+    assert r.gets(False) == b"OK"
+    with pytest.raises(TypeError):
+        r.feed(42)
+
+
 def test_feed_does_not_leak_references():
     data = b"x" * 100
     r = reader()
@@ -378,6 +388,79 @@ def test_huge_length_header_does_not_crash(payload):
     assert r.gets(False) is False
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b",abc\r\n",
+        b",\r\n",
+        b",1 \r\n",
+        b",+1\r\n",
+        b",infinity\r\n",
+        b",1e9999\r\n",
+        b",1e-9999\r\n",
+        b",0x10\r\n",
+        b",1_0\r\n",
+        b",--1\r\n",
+        b"," + b"1" * 400 + b"\r\n",
+        b"#x\r\n",
+        b"#\r\n",
+        b"#true\r\n",
+        b"#t \r\n",
+    ],
+)
+def test_double_and_bool_errors_match_hiredis(payload):
+    outcomes = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.feed(payload)
+        try:
+            outcomes.append(("ok", repr(r.gets(False))))
+        except Exception as exc:
+            outcomes.append((type(exc).__name__, str(exc)))
+    assert outcomes[0] == outcomes[1]
+
+
+def test_valid_doubles_and_bools_still_parse():
+    import math
+
+    for payload, expected in (
+        (b",1.5\r\n", 1.5),
+        (b",inf\r\n", float("inf")),
+        (b",-1.5e308\r\n", -1.5e308),
+        (b"#T\r\n", True),
+        (b"#f\r\n", False),
+    ):
+        r = hpredis.Reader()
+        r.feed(payload)
+        assert r.gets(False) == expected
+    r = hpredis.Reader()
+    r.feed(b",nan\r\n")
+    assert math.isnan(r.gets(False))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"*4294967296\r\n",
+        b">4294967296\r\n",
+        b"%4294967296\r\n",
+        b"~4294967296\r\n",
+        b"|4294967296\r\n",
+    ],
+)
+def test_container_count_range_matches_hiredis(payload):
+    # above UINT32_MAX hiredis raises ProtocolError instead of buffering
+    outcomes = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.feed(payload)
+        try:
+            outcomes.append(("ok", repr(r.gets(False))))
+        except Exception as exc:
+            outcomes.append((type(exc).__name__, str(exc)))
+    assert outcomes[0] == outcomes[1]
+
+
 def test_resp3_bignum_and_attribute_match_hiredis():
     for payload in (
         b"(3492890328409238509324850943850943825024385\r\n",
@@ -414,6 +497,41 @@ def test_push_with_nested_error_is_a_notification_of_errors():
     out = r.gets()
     assert isinstance(out, hpredis.PushNotification)
     assert isinstance(out[0], hpredis.ReplyError)
+
+
+def _reply_shape(obj):
+    if isinstance(obj, list):
+        return (type(obj).__name__, tuple(_reply_shape(x) for x in obj))
+    if isinstance(obj, dict):
+        return ("dict", tuple(sorted((_reply_shape(k), _reply_shape(v)) for k, v in obj.items())))
+    return type(obj).__name__
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b">1\r\n+hello\r\n",
+        b"*1\r\n>1\r\n+hello\r\n",
+        b"*2\r\n>1\r\n+a\r\n>1\r\n+b\r\n",
+        b"%1\r\n+k\r\n>1\r\n+v\r\n",
+        b"~1\r\n>1\r\n+x\r\n",
+    ],
+)
+def test_push_shapes_match_hiredis(payload):
+    shapes = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.feed(payload)
+        shapes.append(_reply_shape(r.gets(False)))
+    assert shapes[0] == shapes[1]
+
+
+def test_drain_wraps_top_level_pushes():
+    r = hpredis.Reader()
+    r.feed(b">1\r\n+hello\r\n")
+    out = r.drain()
+    assert len(out) == 1
+    assert isinstance(out[0], hpredis.PushNotification)
 
 
 def test_set_encoding_and_drain_do_not_leak_references():
@@ -478,18 +596,45 @@ def test_drain_reports_a_raising_reply_error_and_stays_consistent():
 
     def parse_error(msg):
         calls.append(msg)
-        if len(calls) == 1:
-            raise failure
-        return "unexpected second invocation"
+        raise failure
 
     r = hpredis.Reader(replyError=parse_error)
     r.feed(b"+OK\r\n-ERR one\r\n+NEXT\r\n")
+    # replies parsed before the failing one are delivered, not discarded
+    assert r.drain() == [b"OK"]
+    assert calls == ["ERR one"]
     with pytest.raises(Boom) as excinfo:
         r.drain()
     assert excinfo.value is failure
-    assert calls == ["ERR one"]
-    # the error reply was consumed, the rest of the batch is still pending
+    assert calls == ["ERR one", "ERR one"]
+    # the raising drain consumed the error reply; the rest is pending
     assert r.gets() == b"NEXT"
+
+
+def test_drain_delivers_replies_before_a_protocol_error():
+    r = hpredis.Reader()
+    r.feed(b":1\r\n:2\r\n?bad\r\n")
+    assert r.drain(False) == [1, 2]
+    with pytest.raises(hpredis.ProtocolError):
+        r.drain(False)
+    with pytest.raises(hpredis.ProtocolError):  # sticky, like gets()
+        r.gets(False)
+
+
+def test_drain_delivers_replies_before_unhashable_map_key():
+    r = hpredis.Reader()
+    r.feed(b":1\r\n%1\r\n*1\r\n:1\r\n$1\r\nv\r\n")
+    assert r.drain(False) == [1]
+    with pytest.raises(TypeError):
+        r.drain(False)
+
+
+def test_drain_delivers_replies_before_decode_failure():
+    r = hpredis.Reader(encoding="utf-8")
+    r.feed(b"+ok\r\n$2\r\n\xff\xfe\r\n")
+    assert r.drain() == ["ok"]
+    with pytest.raises(UnicodeDecodeError):
+        r.drain()
 
 
 def test_drain_still_converts_nested_markers():
