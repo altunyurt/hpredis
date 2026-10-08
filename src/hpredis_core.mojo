@@ -6,7 +6,7 @@ from std.python.python_object import PyObjectPtr
 from std.python.bindings import PythonModuleBuilder
 from std.os import abort
 from std.ffi import external_call, c_int, c_ssize_t, c_size_t
-from std.collections import Array, List
+from std.collections import List
 from std.origin import MutAnyOrigin, MutUntrackedOrigin
 from std.builtin.value import Defaultable
 from std.format import Writable
@@ -643,15 +643,6 @@ def _status_tuple(status: UInt8, payload: PyObjectPtr) raises -> PythonObject:
     var t = cpy.PyTuple_New(2)
     _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(Int(status)))
     _ = cpy.PyTuple_SetItem(t, 1, payload)
-    return PythonObject(from_owned=t)
-
-
-def _tuple3(a: UInt8, b: Int, c: Int) raises -> PythonObject:
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(3)
-    _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(Int(a)))
-    _ = cpy.PyTuple_SetItem(t, 1, cpy.PyLong_FromSsize_t(b))
-    _ = cpy.PyTuple_SetItem(t, 2, cpy.PyLong_FromSsize_t(c))
     return PythonObject(from_owned=t)
 
 
@@ -1337,10 +1328,6 @@ def _hex_byte(b: Int) -> String:
     out += HEXDIGITS[byte=b & 15]
     out += "\""
     return out
-
-
-def _payload_str(payload: PythonObject) raises -> String:
-    return String(payload)
 
 
 # === Highway scan (leaf slices only) ===

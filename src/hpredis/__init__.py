@@ -114,9 +114,6 @@ class Reader:
         if type(result) is not tuple:
             return result
         status, payload = result
-        if status == 0:
-            # compatibility with cores that return explicit success status
-            return payload
         if status == 1:
             return self._notEnoughData
         if status == 6:
@@ -211,8 +208,7 @@ class Reader:
         self._sync_decoding()
 
     def setmaxbuf(self, value):
-        """hiredis parity: max buffer guard. Value stored; enforcement is
-        phase-5-polish (the hiredis suite does not exercise it)."""
+        """Store hiredis' max-buffer setting; enforcement is not implemented."""
         if value is None:
             value = 0  # default: unlimited
         if not isinstance(value, int):

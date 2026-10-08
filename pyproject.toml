@@ -1,16 +1,13 @@
 [project]
 name = "hpredis"
 version = "0.1.0"
-description = "Add your description here"
+description = "Mojo-based RESP reader compatible with hiredis-py"
 readme = "README.md"
 authors = [
     { name = "Özgür Altunyurt", email = "altunyurt@gmail.com" }
 ]
 requires-python = ">=3.12"
 dependencies = []
-
-[project.scripts]
-hpredis = "hpredis:main"
 
 [build-system]
 requires = ["setuptools>=75"]

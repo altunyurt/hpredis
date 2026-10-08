@@ -1,6 +1,4 @@
-"""Prebuilt-binary wheel pattern: the .so is compiled by Mojo
-(dev/phase/05/output/build_release.sh), not by setuptools. Declaring the
-extension here only forces a platform-specific wheel tag."""
+"""Bundle the prebuilt Mojo extension and mark the wheel platform-specific."""
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext

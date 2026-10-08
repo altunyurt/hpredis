@@ -1,11 +1,11 @@
 # hpredis — a Mojo drop-in replacement for hiredis-py
 
-A Mojo-based RESP parser that is interface-identical to
-[hiredis-py](https://github.com/redis/hiredis-py), plus an optional
-zero-copy **Highway Mode** for AI/ML vector workloads.
+A Mojo-based RESP parser with a hiredis-py-compatible `Reader` API, plus an
+optional zero-copy **Highway Mode** for AI/ML vector workloads.
 
 ```python
 import hpredis
+import numpy as np
 
 # classic: drop-in for hiredis.Reader (feed/gets, redis-py compatible)
 r = hpredis.Reader()
@@ -14,6 +14,7 @@ assert r.gets() == [b"hello", b"world"]
 
 # highway: one call gives an offsets table plus the buffer it points into
 h = hpredis.Reader(highway_mode=True)
+vector_bytes = bytes(6144)  # replace with a packed vector
 h.feed(b"$6144\r\n" + vector_bytes + b"\r\n")
 table, arena = h.gets()                     # n*24 bytes: (offset, length, type)
 # read the whole table in one call (don't struct.unpack per slice)
@@ -25,17 +26,13 @@ arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 ## Features
 
 - `Reader(protocolError, replyError, encoding, errors, notEnoughData,
-  highway_mode)` — full hiredis-py 3.4.2 interface parity, verified by a
-  seeded **differential fuzzer** (300+ mutated payloads, fragmented feeds,
-  multi-reply streams, 5 MB bulks, depth-50 nesting) with hiredis-py as the
-  oracle
+  highway_mode)` — hiredis-py 3.4.2 Reader compatibility, checked against the
+  upstream Reader tests
 - redis-py 8.1 integration tested end-to-end (ping/get/set/hset/incr/lrange/
   pipelines, `decode_responses`, `CLIENT SETINFO`, fragmented recv)
 - Highway mode: one call returns an offsets table plus the `bytearray` it
   points into, so NumPy/PyTorch/JAX read payloads without a copy and without a
   per-slice call; views own their bytes (valid across later feeds)
-- Zero Python-heap traffic on feed+parse; allocations constant regardless of
-  payload size
 
 ## Install
 
@@ -43,45 +40,37 @@ arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 pip install hpredis          # platform wheel, no toolchain required
 ```
 
-Building from source (requires the Mojo toolchain — `pip install mojo`):
+Building from source (requires the Mojo toolchain):
 
 ```bash
-uv sync                      # dev env: mojo, pytest, hiredis, redis, numpy
-./dev/phase/05/output/build_release.sh   # compiles src/hpredis/hpredis_core.so
-uv build --wheel             # platform-tagged wheel
-pytest                       # 55 tests across the 5 TDD phases
+uv sync
+env -u PYTHONPATH -u PYTHONEXECUTABLE .venv/bin/mojo build \
+  src/hpredis_core.mojo --emit shared-lib -o src/hpredis/hpredis_core.so
+uv build --wheel
+.venv/bin/python -m pytest -q
 ```
 
-## Benchmark matrix (advisory, single machine)
+## Benchmarking
 
-```
-corpus         hiredis      hpredis   highway
-multibulk-10k  1893.7 MB/s   349.7    1190.6
-simples-100k     45.2 MB/s    10.5      15.0
-vector-1536f32 13960.7 MB/s  6088.9    1385.6
-deep-50          96.8 MB/s    14.7     127.2
-```
+Measure representative reply shapes separately: single-reply `gets()`,
+buffered `drain()`, and native Highway consumers have different costs.
 
 ## Architecture
 
 ```
-Python bytes ──feed──► Mojo arena (malloc/realloc, C-heap only)
+Python bytes ──feed──► Mojo-managed bytearray arena
                           │  RESP scanner (memchr CRLF search)
                           ├─► classic: CPython C-API objects (list/bytes/int)
                           └─► highway: (offsets table, arena) for native reads
 ```
 
-Five TDD phases, each with spec + tests + self-contained output
-(`dev/phase/NN/`): engine (1) → dual output (2) → hiredis-parity Reader (3)
-→ AI highway (4) → fuzz/bench/distribution (5). The release bundle is
-built from the phase-4 output by `dev/phase/05/output/build_release.sh`.
-
 ## Limitations
 
-- Classic mode is 0.15–0.45× hiredis-py throughput (advisory, unoptimized v1)
-- RESP3 types (maps, push notifications, `pack_command`) not yet supported;
-  RESP2 covers the redis-py default paths
-- Highway mode keeps the arena alive while a view is held (a feed moves to a
-  fresh buffer rather than overwriting visible bytes); releasing views lets the
-  next feed rewind it
+- Per-reply `gets()` is slower for tiny responses; `drain()` batches buffered
+  replies and is faster for pipeline workloads
+- Highway Mode exposes flattened byte slices, not nested Python reply objects;
+  it is intended for native consumers
+- `setmaxbuf()` stores the hiredis-compatible value but does not enforce it
+- Highway views keep their arena alive across feeds; the reader detaches rather
+  than overwriting bytes that are still viewed
 - Protocol-error messages match hiredis byte-for-byte, including escapes
