@@ -38,6 +38,10 @@ class Reader:
         highway_mode=False,
     ):
         self._core = _core.Reader()
+        self._pending = []
+        self._pending_lengths = []
+        self._pending_index = 0
+        self._pending_count = 0
         if not callable(protocolError if protocolError is not None else ProtocolError):
             raise TypeError("protocolError must be callable")
         if not callable(replyError if replyError is not None else ReplyError):
@@ -84,10 +88,30 @@ class Reader:
         (redis-py's disable_decoding path calls gets(False))."""
         if self._highway:
             return self._highway_gets()
+        if self._pending_index >= self._pending_count and self._encoding is None:
+            prefetched = self._core.prefetch_clean()
+            if type(prefetched) is not tuple:
+                return prefetched
+            if len(prefetched) == 3:
+                _, self._pending, self._pending_lengths = prefetched
+                self._pending_count = len(self._pending)
+                self._pending_index = 0
+            elif prefetched[0] == 1:
+                return self._notEnoughData
+        if self._pending_index < self._pending_count:
+            index = self._pending_index
+            reply = self._pending[index]
+            self._pending_index = index + 1
+            if self._pending_index == self._pending_count:
+                self._clear_pending()
+            if self._encoding is not None and should_decode:
+                return self._finalize(reply, should_decode)
+            return reply
         result = self._core.try_gets(1 if should_decode else 0)
+        return self._handle_gets_result(result, should_decode)
+
+    def _handle_gets_result(self, result, should_decode):
         if type(result) is not tuple:
-            # clean replies return directly; only exceptional statuses allocate
-            # a (status, payload) tuple
             return result
         status, payload = result
         if status == 0:
@@ -114,6 +138,12 @@ class Reader:
             return PushNotification(payload)
         raise TypeError("unhashable type in map reply")  # status 5
 
+    def _clear_pending(self):
+        self._pending = []
+        self._pending_lengths = []
+        self._pending_index = 0
+        self._pending_count = 0
+
     def drain(self, should_decode=True):
         """Parse every complete reply already buffered and return them as a
         list, in one core call.  A `while r.gets() is not False: ...` loop
@@ -125,6 +155,9 @@ class Reader:
         """
         if self._highway:
             raise RuntimeError("drain() is not available in highway mode")
+        pending_replies = self._pending[self._pending_index : self._pending_count]
+        if pending_replies:
+            self._clear_pending()
         replies, proto_msg, dict_err, had_markers, dec_failed, raise_exc = self._core.drain(
             1 if should_decode else 0, self._replyError
         )
@@ -137,7 +170,11 @@ class Reader:
         if raise_exc is not None:
             # the core captured the original exception from replyError
             raise raise_exc
-        if had_markers:
+        if pending_replies:
+            replies = pending_replies + replies
+            if had_markers or (self._encoding is not None and should_decode):
+                replies = [self._finalize(r, should_decode) for r in replies]
+        elif had_markers:
             # nested markers (an array holding an error) are the only case that
             # still needs the Python walk
             replies = [self._finalize(r, should_decode) for r in replies]
@@ -188,17 +225,18 @@ class Reader:
         return self._maxbuf
 
     def len(self):
-        return self._core.buffered()
+        return sum(self._pending_lengths[self._pending_index : self._pending_count]) + self._core.buffered()
 
     def __len__(self):
-        return self._core.buffered()
+        return sum(self._pending_lengths[self._pending_index : self._pending_count]) + self._core.buffered()
 
     def has_data(self):
         """redis-py 8 can_read() support."""
-        return self._core.buffered() > 0
+        return self._pending_index < self._pending_count or self._core.buffered() > 0
 
     def close(self):
         """Release the core's arena now instead of at garbage collection."""
+        self._clear_pending()
         core = getattr(self, "_core", None)
         if core is not None and not getattr(self, "_closed", False):
             self._closed = True

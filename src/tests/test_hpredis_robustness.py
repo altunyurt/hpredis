@@ -266,7 +266,78 @@ def test_reader_gc_does_not_leak_the_arena():
     assert peak - before < 32
 
 
+# --- gets(): bounded read-ahead --------------------------------------------
+
+
+def test_gets_prefetches_clean_replies_and_tracks_unread_bytes():
+    r = reader()
+    r.feed(b"+A\r\n$1\r\nb\r\n:7\r\n")
+    assert r.gets() == b"A"
+    assert r._core.buffered() == 0
+    assert r.len() == len(b"$1\r\nb\r\n:7\r\n")
+    assert r.has_data()
+    assert r.gets() == b"b"
+    assert r.len() == len(b":7\r\n")
+    assert r.gets() == 7
+    assert r.len() == 0
+    assert r.gets() is False
+
+
 # --- gets(): direct success return across the Mojo/Python boundary ----------
+
+
+def test_gets_read_ahead_queue_is_bounded():
+    data = b"+OK\r\n" * 5000
+    r = reader()
+    r.feed(data)
+    assert r.gets() == b"OK"
+    assert r._pending_count - r._pending_index == 4095
+    assert r._core.buffered() == (5000 - 4096) * len(b"+OK\r\n")
+    assert r.len() == len(data) - len(b"+OK\r\n")
+    assert r.drain() == [b"OK"] * 4999
+    assert r.len() == 0
+
+
+def test_gets_prefetch_keeps_partial_tail_for_next_feed():
+    r = reader()
+    r.feed(b"+one\r\n+par")
+    assert r.gets() == b"one"
+    assert r.len() == len(b"+par")
+    assert r.gets() is False
+    r.feed(b"tial\r\n+two\r\n")
+    assert r.gets() == b"partial"
+    assert r.gets() == b"two"
+    assert r.gets() is False
+    assert len(r) == 0
+
+
+def test_gets_prefetch_does_not_run_reply_error_early():
+    calls = []
+
+    class Boom(Exception):
+        pass
+
+    def parse_error(message):
+        calls.append(message)
+        raise Boom(message)
+
+    r = reader(replyError=parse_error)
+    r.feed(b"+first\r\n-ERR failure\r\n+last\r\n")
+    assert r.gets() == b"first"
+    assert calls == []
+    with pytest.raises(Boom, match="ERR failure"):
+        r.gets()
+    assert calls == ["ERR failure"]
+    assert r.gets() == b"last"
+
+
+def test_prefetched_replies_honor_later_encoding_and_drain():
+    r = reader()
+    r.feed(b"$1\r\nx\r\n$1\r\ny\r\n")
+    assert r.gets(False) == b"x"
+    r.set_encoding("utf-8")
+    assert r.drain() == ["y"]
+    assert r.len() == 0
 
 
 def test_core_gets_returns_clean_reply_without_status_tuple():

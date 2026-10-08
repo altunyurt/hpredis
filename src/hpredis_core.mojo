@@ -30,6 +30,14 @@ comptime ST_DICT_ERR = 5
 comptime ST_OK_MARKERS = 6
 # a leaf failed strict decoding: the wrapper re-raises the real codec error
 comptime ST_DECODE_ERR = 7
+# private prefetch outcomes
+comptime ST_PREFETCH_SPECIAL = 8
+comptime ST_PREFETCH_BATCH = 9
+
+# ponytail: cap batches between replies at 64 KiB / 4096 items; one oversized
+# scalar is unavoidable. Raise the cap only if profiling justifies it.
+comptime PREFETCH_MAX_REPLIES = 4096
+comptime PREFETCH_MAX_BYTES = 65536
 
 # nested error marker sentinel (tuple[0]); unique, never valid RESP data
 comptime ERR_SENTINEL = "\x00hpredis-error\x00"
@@ -204,6 +212,81 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].proto_err = True
         self_ptr[].proto_err_msg = node.err_msg
         return _status_tuple(ST_PROTO_ERR, node.payload.steal_data())
+
+    @staticmethod
+    def prefetch_clean(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+        """Batch clean scalar replies; return a lone reply directly.
+
+        Containers/errors remain for try_gets. The caller uses this only when
+        decoding is disabled. Batched replies include wire lengths so the
+        wrapper can preserve len() while holding its bounded queue.
+        """
+        var collected = List[PyObjectPtr]()
+        var lengths = List[PyObjectPtr]()
+        var first_payload = PyObjectPtr()
+        var first_length = 0
+        var reply_count = 0
+        var batch_bytes = 0
+        var special = False
+        ref cpy = Python().cpython()
+        if self_ptr[].proto_err:
+            return _status_tuple(ST_PREFETCH_SPECIAL, _none_payload())
+        if self_ptr[].consumed >= self_ptr[].buf_len:
+            return _status_tuple(ST_INCOMPLETE, _none_payload())
+        var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
+        var cnv = DecodeCtx(
+            enabled=False,
+            encoding=self_ptr[].dec_encoding,
+            errors=self_ptr[].dec_errors,
+            failed=False)
+        while reply_count < PREFETCH_MAX_REPLIES and batch_bytes < PREFETCH_MAX_BYTES:
+            if self_ptr[].consumed >= self_ptr[].buf_len:
+                break
+            if self_ptr[].needs_scan:
+                var sc = _scan_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
+                if sc.status == ST_INCOMPLETE:
+                    break
+                self_ptr[].needs_scan = False
+                if sc.status == ST_PROTO_ERR:
+                    special = True
+                    break
+            var pos = self_ptr[].consumed
+            var t = ptr.unsafe_offset(pos)[]
+            # Containers and pushes have wrapper-specific finalization.
+            if t == TYPE_ARRAY or t == 62 or t == 37 or t == 126:
+                special = True
+                break
+            var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
+            if node.status == ST_INCOMPLETE:
+                self_ptr[].needs_scan = True
+                break
+            self_ptr[].needs_scan = False
+            if node.status != ST_OK or node.had_err or cnv.failed:
+                special = True
+                break
+            var wire_len = node.pos - pos
+            self_ptr[].consumed = node.pos
+            var payload = node.payload.steal_data()
+            if reply_count == 0:
+                first_payload = payload
+                first_length = wire_len
+            else:
+                if reply_count == 1:
+                    collected.append(first_payload)
+                    lengths.append(cpy.PyLong_FromSsize_t(first_length))
+                collected.append(payload)
+                lengths.append(cpy.PyLong_FromSsize_t(wire_len))
+            reply_count += 1
+            batch_bytes += wire_len
+        _ = _compact(self_ptr[])
+        if reply_count == 0:
+            var status: UInt8 = ST_INCOMPLETE
+            if special:
+                status = ST_PREFETCH_SPECIAL
+            return _status_tuple(status, _none_payload())
+        if reply_count == 1:
+            return PythonObject(from_owned=first_payload)
+        return _prefetch_batch_result(_list_of(collected), _list_of(lengths))
 
     @staticmethod
     def free(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
@@ -589,6 +672,15 @@ def _hw_tuple(a: PyObjectPtr, b: PyObjectPtr, c: PyObjectPtr) raises -> PythonOb
     return PythonObject(from_owned=t)
 
 
+def _prefetch_batch_result(replies: PyObjectPtr, lengths: PyObjectPtr) raises -> PythonObject:
+    ref cpy = Python().cpython()
+    var t = cpy.PyTuple_New(3)
+    _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(ST_PREFETCH_BATCH))
+    _ = cpy.PyTuple_SetItem(t, 1, replies)
+    _ = cpy.PyTuple_SetItem(t, 2, lengths)
+    return PythonObject(from_owned=t)
+
+
 def _drain_result(
     replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_err: Bool, had_markers: Bool,
     dec_failed: Bool, raise_exc: PyObjectPtr
@@ -650,7 +742,8 @@ def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -
         return 0
     _ = cpy.PyTuple_SetItem(args, 0, text)
     var inst = external_call["PyObject_CallObject", PyObjectPtr](
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr), args)
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(args)))
     _ = cpy.Py_DecRef(args)
     if Int(inst) == 0:
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
@@ -1413,6 +1506,7 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_init_defaultable[Reader]() \
             .def_method[Reader.feed]("feed") \
             .def_method[Reader.try_gets]("try_gets") \
+            .def_method[Reader.prefetch_clean]("prefetch_clean") \
             .def_method[Reader.free]("free") \
             .def_method[Reader.set_decoding]("set_decoding") \
             .def_method[Reader.clear_decoding]("clear_decoding") \
