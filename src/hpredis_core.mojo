@@ -100,6 +100,8 @@ struct Reader(Defaultable, Movable, Writable):
     # the wrapper's replyError callable, cached once (see set_reply_error)
     var reply_error: Int
     var reply_error_weak: Bool
+    # hiredis-compatible maxbuf: gates idle free-space trimming, not input
+    var maxbuf: Int
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
     # ponytail: resume between top-level collection children; an incomplete
@@ -124,6 +126,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.dec_errors = 0
         self.reply_error = 0
         self.reply_error_weak = False
+        self.maxbuf = 16384
         self.needs_scan = False
         self.scan_active = False
         self.scan_pos = 0
@@ -180,6 +183,14 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].dec_enabled = False
         self_ptr[].dec_encoding = 0
         self_ptr[].dec_errors = 0
+        return PythonObject(0)
+
+    @staticmethod
+    def set_maxbuf(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], value: PythonObject
+    ) raises -> PythonObject:
+        """Store maxbuf (the wrapper validates it); 0 disables trimming."""
+        self_ptr[].maxbuf = Int(py=value)
         return PythonObject(0)
 
     @staticmethod
@@ -426,7 +437,8 @@ struct Reader(Defaultable, Movable, Writable):
             failed=False)
         if self_ptr[].proto_err:
             return _drain_result(
-                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), False, False, False, _none_payload())
+                _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), _none_payload(),
+                False, False, _none_payload())
         if self_ptr[].consumed < self_ptr[].buf_len:
             var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
             var had_markers = False
@@ -449,7 +461,8 @@ struct Reader(Defaultable, Movable, Writable):
                     self_ptr[].consumed = node.pos
                     _ = _compact(self_ptr[])
                     return _drain_result(
-                        _list_of(collected), _none_payload(), True, True, cnv.failed, _none_payload())
+                        _list_of(collected), _none_payload(), node.payload.steal_data(),
+                        False, cnv.failed, _none_payload())
                 if node.status == ST_PROTO_ERR:
                     if len(collected) > 0:
                         # leave it pending for the next drain()/gets()
@@ -459,7 +472,8 @@ struct Reader(Defaultable, Movable, Writable):
                     self_ptr[].proto_err_msg = node.err_msg
                     _ = _compact(self_ptr[])
                     return _drain_result(
-                        _list_of(collected), _bytes_payload(node.err_msg), False, False, cnv.failed, _none_payload())
+                        _list_of(collected), _bytes_payload(node.err_msg), _none_payload(),
+                        False, cnv.failed, _none_payload())
                 if node.status == ST_REPLY_ERR and re_ptr != 0:
                     var marker = Int(node.payload.steal_data())
                     var callback_error = PyObjectPtr()
@@ -512,9 +526,10 @@ struct Reader(Defaultable, Movable, Writable):
             # compact once for the whole batch (gets compacts per reply)
             _ = _compact(self_ptr[])
             return _drain_result(
-                _list_of(collected), _none_payload(), False, had_markers, cnv.failed, raise_exc)
+                _list_of(collected), _none_payload(), _none_payload(), had_markers,
+                cnv.failed, raise_exc)
         return _drain_result(
-            _list_of(collected), _none_payload(), False, False, cnv.failed, _none_payload())
+            _list_of(collected), _none_payload(), _none_payload(), False, cnv.failed, _none_payload())
 
     @staticmethod
     def buffered(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
@@ -709,12 +724,12 @@ def _compact(mut r: Reader) -> Bool:
         r.scan_pos = 0
         r.scan_remaining = 0
         # released an oversized arena instead of pinning it for the life of
-        # the reader (hiredis frees an empty buffer larger than maxbuf)
-        if r.buf_cap > 16384 and not _arena_pinned(r):
+        # the reader (hiredis trims an empty buffer's free space above maxbuf)
+        if r.maxbuf > 0 and r.buf_cap > r.maxbuf and not _arena_pinned(r):
             var rc = external_call["PyByteArray_Resize", c_int](
-                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj), c_ssize_t(16384))
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj), c_ssize_t(r.maxbuf))
             if rc == 0:
-                r.buf_cap = 16384
+                r.buf_cap = r.maxbuf
                 r.buf_addr = Int(_arena_ptr(r.buf_obj))
             else:
                 _ = Python().cpython().PyErr_Clear()
@@ -827,14 +842,14 @@ def _prefetch_batch_result(replies: PyObjectPtr, lengths: PyObjectPtr) raises ->
 
 
 def _drain_result(
-    replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_err: Bool, had_markers: Bool,
+    replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_exc: PyObjectPtr, had_markers: Bool,
     dec_failed: Bool, raise_exc: PyObjectPtr
 ) raises -> PythonObject:
     ref cpy = Python().cpython()
     var t = cpy.PyTuple_New(6)
     _ = cpy.PyTuple_SetItem(t, 0, replies)
     _ = cpy.PyTuple_SetItem(t, 1, proto_msg)
-    _ = cpy.PyTuple_SetItem(t, 2, cpy.PyBool_FromLong(1) if dict_err else cpy.PyBool_FromLong(0))
+    _ = cpy.PyTuple_SetItem(t, 2, dict_exc)
     _ = cpy.PyTuple_SetItem(t, 3, cpy.PyBool_FromLong(1) if had_markers else cpy.PyBool_FromLong(0))
     _ = cpy.PyTuple_SetItem(t, 4, cpy.PyBool_FromLong(1) if dec_failed else cpy.PyBool_FromLong(0))
     _ = cpy.PyTuple_SetItem(t, 5, raise_exc)
@@ -1731,10 +1746,13 @@ def _parse_node(
             _ = cpy4.Py_DecRef(kp)
             _ = cpy4.Py_DecRef(vp)
             if rc != 0:
-                # unhashable key etc: clear the CPython error, signal the wrapper
-                cpy4.PyErr_Clear()
+                # unhashable key: keep CPython's TypeError (type, args and
+                # message) for the wrapper to raise
+                var dict_exc = external_call["PyErr_GetRaisedException", PyObjectPtr]()
                 _ = cpy4.Py_DecRef(dict_obj)
-                return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=_none_payload()))
+                if Int(dict_exc) == 0:
+                    return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=_none_payload()))
+                return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=dict_exc))
         var map_node = Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
         map_node.had_err = saw_err3
         return map_node^
@@ -1969,6 +1987,7 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_method[Reader.free]("free") \
             .def_method[Reader.set_decoding]("set_decoding") \
             .def_method[Reader.set_reply_error]("set_reply_error") \
+            .def_method[Reader.set_maxbuf]("set_maxbuf") \
             .def_method[Reader.clear_decoding]("clear_decoding") \
             .def_method[Reader.drain]("drain") \
             .def_method[Reader.buffered]("buffered") \

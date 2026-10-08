@@ -197,6 +197,8 @@ class Reader:
         if status == 4:
             # pushes can carry nested error markers too
             return PushNotification(self._finalize(payload, should_decode))
+        if isinstance(payload, BaseException):
+            raise payload  # CPython's TypeError from the dict insert
         raise TypeError("unhashable type in map reply")  # status 5
 
     def _clear_pending(self):
@@ -219,11 +221,11 @@ class Reader:
         pending_replies = self._pending[self._pending_index : self._pending_count]
         if pending_replies:
             self._clear_pending()
-        replies, proto_msg, dict_err, had_markers, dec_failed, raise_exc = self._core.drain(
+        replies, proto_msg, dict_exc, had_markers, dec_failed, raise_exc = self._core.drain(
             1 if should_decode else 0
         )
-        if dict_err:
-            raise TypeError("unhashable type in map reply")
+        if dict_exc is not None:
+            raise dict_exc
         if proto_msg is not None:
             raise self._protocolError(self._decode_msg(proto_msg))
         if dec_failed:
@@ -272,7 +274,12 @@ class Reader:
         self._sync_decoding()
 
     def setmaxbuf(self, value):
-        """Store hiredis' max-buffer setting; enforcement is not implemented."""
+        """hiredis' maxbuf: gates idle free-space trimming, not input.
+
+        hiredis does not use it to reject large replies (verified 3.4.2), and
+        neither do we; the value sets the arena size kept after a fully
+        consumed batch.  0 disables trimming.
+        """
         if value is None:
             value = 16384  # hiredis resets to its default buffer size
         if not isinstance(value, int):
@@ -280,6 +287,7 @@ class Reader:
         if value < 0:
             raise ValueError("maxbuf must be >= 0")
         self._maxbuf = value
+        self._core.set_maxbuf(value)
 
     def getmaxbuf(self):
         return self._maxbuf

@@ -490,8 +490,31 @@ def test_resp3_bignum_and_attribute_match_hiredis():
 def test_nested_unhashable_map_key_raises_type_error():
     r = reader()
     r.feed(b"*1\r\n%1\r\n*1\r\n:1\r\n$1\r\nv\r\n")
-    with pytest.raises(TypeError):
+    # CPython's own message, exactly as hiredis surfaces it
+    with pytest.raises(TypeError, match="unhashable type: 'list'"):
         r.gets(False)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"%1\r\n*1\r\n:1\r\n$1\r\nv\r\n!5\r\nboom\r\n",
+        b"*1\r\n%1\r\n*1\r\n:1\r\n$1\r\nv\r\n",
+        b"!5\r\nboom\r\n%1\r\n*1\r\n:1\r\n$1\r\nv\r\n",
+    ],
+)
+def test_unhashable_key_first_error_matches_hiredis(payload):
+    # only the first outcome is compared: after its own dict-insert failure
+    # hiredis' reader reports "Out of memory" for everything that follows
+    outcomes = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.feed(payload)
+        try:
+            outcomes.append(("ok", repr(r.gets(False))))
+        except Exception as exc:
+            outcomes.append((type(exc).__name__, str(exc)))
+    assert outcomes[0] == outcomes[1]
 
 
 def test_map_value_error_marker_is_finalized():
@@ -577,6 +600,20 @@ def test_maxbuf_defaults_and_reset_match_hiredis():
     assert r.getmaxbuf() == 100
     r.setmaxbuf(None)
     assert r.getmaxbuf() == 16384
+
+
+def test_maxbuf_is_not_an_input_limit():
+    # hiredis stores maxbuf for idle trimming; it never rejects large replies
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.setmaxbuf(1024)
+        r.feed(b"$4096\r\n" + b"x" * 4096 + b"\r\n")
+        assert r.gets(False) == b"x" * 4096
+        r = mod.Reader()
+        r.setmaxbuf(1024)
+        r.feed(b"$1048576\r\n" + b"x" * 10)
+        assert r.gets(False) is False
+        assert r.len() == 20
 
 
 def test_exports_and_error_hierarchy_match_hiredis():
