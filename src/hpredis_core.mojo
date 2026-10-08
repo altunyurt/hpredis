@@ -184,12 +184,13 @@ struct Reader(Defaultable, Movable, Writable):
         if node.status == ST_OK or node.status == ST_PUSH:
             self_ptr[].consumed = node.pos
             _ = _compact(self_ptr[])
-            var st = node.status
             if cnv.failed:
-                st = ST_DECODE_ERR
-            elif node.status == ST_OK and node.had_err:
-                st = ST_OK_MARKERS
-            return _status_tuple(st, node.payload.steal_data())
+                return _status_tuple(ST_DECODE_ERR, node.payload.steal_data())
+            if node.status == ST_OK and node.had_err:
+                return _status_tuple(ST_OK_MARKERS, node.payload.steal_data())
+            if node.status == ST_OK:
+                return PythonObject(from_owned=node.payload.steal_data())
+            return _status_tuple(ST_PUSH, node.payload.steal_data())
         if node.status == ST_REPLY_ERR:
             # consumed (matches hiredis); wrapper builds the replyError instance
             self_ptr[].consumed = node.pos

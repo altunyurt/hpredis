@@ -84,9 +84,14 @@ class Reader:
         (redis-py's disable_decoding path calls gets(False))."""
         if self._highway:
             return self._highway_gets()
-        status, payload = self._core.try_gets(1 if should_decode else 0)
+        result = self._core.try_gets(1 if should_decode else 0)
+        if type(result) is not tuple:
+            # clean replies return directly; only exceptional statuses allocate
+            # a (status, payload) tuple
+            return result
+        status, payload = result
         if status == 0:
-            # string leaves were decoded in the core when an encoding is set
+            # compatibility with cores that return explicit success status
             return payload
         if status == 1:
             return self._notEnoughData

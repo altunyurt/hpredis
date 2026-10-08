@@ -266,6 +266,15 @@ def test_reader_gc_does_not_leak_the_arena():
     assert peak - before < 32
 
 
+# --- gets(): direct success return across the Mojo/Python boundary ----------
+
+
+def test_core_gets_returns_clean_reply_without_status_tuple():
+    r = reader()
+    r.feed(b"+OK\r\n")
+    assert r._core.try_gets(0) == b"OK"
+
+
 # --- drain(): error replies built in the core ------------------------------
 
 
