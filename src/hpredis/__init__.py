@@ -120,7 +120,7 @@ class Reader:
         """
         if self._highway:
             raise RuntimeError("drain() is not available in highway mode")
-        replies, proto_msg, dict_err, had_markers, dec_failed, raise_msg = self._core.drain(
+        replies, proto_msg, dict_err, had_markers, dec_failed, raise_exc = self._core.drain(
             1 if should_decode else 0, self._replyError
         )
         if dict_err:
@@ -129,11 +129,9 @@ class Reader:
             raise self._protocolError(self._decode_msg(proto_msg))
         if dec_failed:
             self._raise_decode_error(replies)
-        if raise_msg is not None:
-            # the core called replyError and it raised (redis-py's parse_error
-            # raises by design): calling it here surfaces the real exception,
-            # and the replies already parsed stay valid
-            replies.append(self._replyError(self._decode_msg(raise_msg)))
+        if raise_exc is not None:
+            # the core captured the original exception from replyError
+            raise raise_exc
         if had_markers:
             # nested markers (an array holding an error) are the only case that
             # still needs the Python walk
@@ -145,8 +143,10 @@ class Reader:
 
         table is n*24 bytes of little-endian int64 triples
         (offset, length, resp_type) with offsets into arena, which is the
-        bytearray holding the reply.  Read payloads natively:
-            off, length, typ = struct.unpack_from("<qqq", table, i * 24)
+        bytearray holding the reply.  Read the table in one call:
+            triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
+        then read payloads directly from arena:
+            off, length, typ = triples[i]
             arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
         A view of the arena owns its data: it stays valid across feeds (the
         core moves to a fresh arena instead of resizing an exported one).

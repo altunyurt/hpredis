@@ -281,14 +281,21 @@ def test_drain_reports_a_raising_reply_error_and_stays_consistent():
     class Boom(Exception):
         pass
 
+    calls = []
+    failure = Boom("ERR one")
+
     def parse_error(msg):
-        raise Boom(msg)
+        calls.append(msg)
+        if len(calls) == 1:
+            raise failure
+        return "unexpected second invocation"
 
     r = hpredis.Reader(replyError=parse_error)
     r.feed(b"+OK\r\n-ERR one\r\n+NEXT\r\n")
     with pytest.raises(Boom) as excinfo:
         r.drain()
-    assert str(excinfo.value) == "ERR one"
+    assert excinfo.value is failure
+    assert calls == ["ERR one"]
     # the error reply was consumed, the rest of the batch is still pending
     assert r.gets() == b"NEXT"
 
