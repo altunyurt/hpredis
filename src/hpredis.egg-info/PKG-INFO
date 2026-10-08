@@ -47,17 +47,21 @@ arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 ## Install
 
 ```bash
-pip install hpredis          # platform wheel, no toolchain required
+pip install hpredis   # platform wheel, no toolchain required
+pip install .         # source checkout: builds the Mojo extension
 ```
 
-Building from source (requires the Mojo toolchain):
+A prebuilt wheel ships `hpredis_core.so`, so installing it needs no
+toolchain. Installing from a clone compiles `src/hpredis_core.mojo` with
+`build.sh` and therefore requires `pip install mojo`.
+
+## Development
 
 ```bash
-uv sync
-env -u PYTHONPATH -u PYTHONEXECUTABLE .venv/bin/mojo build \
-  src/hpredis_core.mojo --emit shared-lib -o src/hpredis/hpredis_core.so
-uv build --wheel
+uv sync                      # venv: mojo, pytest, hiredis, fakeredis, numpy
+./build.sh                   # compile src/hpredis_core.mojo (MOJO=... overrides)
 .venv/bin/python -m pytest -q
+uv build --wheel             # platform wheel with the prebuilt .so
 ```
 
 ## Benchmarking

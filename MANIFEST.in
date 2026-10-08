@@ -1,0 +1,4 @@
+# The source distribution has to carry what setup.py needs to build the
+# Mojo extension on install (the wheel ships the prebuilt .so instead).
+include build.sh
+include src/hpredis_core.mojo

@@ -1,4 +1,4 @@
-"""Shared pytest fixtures for all phases.
+"""Shared pytest fixtures.
 
 NOTE: importing a PythonMojo-bound extension module `setenv`s
 `PYTHONPATH=':'` and `PYTHONEXECUTABLE=/usr/bin/python3` at the C level
@@ -21,7 +21,11 @@ def mojo_env() -> dict:
 
 
 def build_module(phase_dir: Path, src_name: str, so_name: str) -> Path:
-    """Compile a Mojo phase source into a shared-lib extension module."""
+    """Compile a Mojo phase source into a shared-lib extension module.
+
+    Used by the optional dev/ phase tests; the release suite only needs
+    ensure_release_bundle() below.
+    """
     output_dir = phase_dir / "output"
     src = output_dir / src_name
     if not src.exists():
@@ -52,7 +56,7 @@ def ensure_release_bundle() -> None:
     if so.exists():
         return
     subprocess.run(
-        [str(root / "dev/phase/05/output/build_release.sh")],
+        ["bash", str(root / "build.sh")],
         check=True,
         capture_output=True,
         env=mojo_env(),
@@ -60,6 +64,6 @@ def ensure_release_bundle() -> None:
 
 
 def pytest_configure(config):
-    """src/tests/ (adapted hiredis suite) imports the release bundle.
-    Runs before collection, so the import resolves."""
+    """src/tests/ imports the release bundle. Runs before collection, so the
+    import resolves on a fresh clone without any prebuilt artifacts."""
     ensure_release_bundle()
