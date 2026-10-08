@@ -79,6 +79,23 @@ def test_reader_release_frees_cached_references():
     assert sys.getrefcount(parse_error) == baseline
 
 
+def test_del_tolerates_a_core_without_dispose():
+    # a Reader built against an older hpredis_core.so has no dispose(); the
+    # finalizer must fall back to free() instead of raising into pytest
+    class OldCore:
+        def __init__(self):
+            self.freed = False
+
+        def free(self):
+            self.freed = True
+
+    r = hpredis.Reader()
+    old = OldCore()
+    r._core = old
+    r.__del__()
+    assert old.freed is True
+
+
 def test_error_replies_do_not_leak():
     r = reader()
 

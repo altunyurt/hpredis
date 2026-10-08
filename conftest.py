@@ -50,10 +50,15 @@ def build_module(phase_dir: Path, src_name: str, so_name: str) -> Path:
 
 
 def ensure_release_bundle() -> None:
-    """Build src/hpredis (release bundle) if missing: src/tests/ imports it."""
+    """Build src/hpredis (release bundle) if missing or older than its source.
+
+    A stale .so silently misses new core methods (e.g. dispose()), so compare
+    mtimes instead of only checking existence.
+    """
     root = Path(__file__).parent
     so = root / "src" / "hpredis" / "hpredis_core.so"
-    if so.exists():
+    source = root / "src" / "hpredis_core.mojo"
+    if so.exists() and so.stat().st_mtime >= source.stat().st_mtime:
         return
     subprocess.run(
         ["bash", str(root / "build.sh")],

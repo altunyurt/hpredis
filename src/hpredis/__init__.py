@@ -319,11 +319,20 @@ class Reader:
             core.free()
 
     def __del__(self):
-        # release the arena and the cached Python references; close() is the
-        # public, reusable API
+        # release the arena and cached refs; the wrapper may outlive an older
+        # core build that has no dispose(), so fall back to free() and never
+        # let a finalizer raise
         core = getattr(self, "_core", None)
-        if core is not None:
-            core.dispose()
+        if core is None:
+            return
+        try:
+            release = getattr(core, "dispose", None)
+            if release is not None:
+                release()
+            else:
+                core.free()
+        except Exception:
+            pass
 
     def _sync_decoding(self):
         """Push the codec configuration into the core, which decodes string
