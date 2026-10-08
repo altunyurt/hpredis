@@ -95,8 +95,15 @@ struct Reader(Defaultable, Movable, Writable):
     var dec_enabled: Bool
     var dec_encoding: Int
     var dec_errors: Int
+    # the wrapper's replyError callable, cached once (see set_reply_error)
+    var reply_error: Int
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
+    # ponytail: resume between top-level collection children; an incomplete
+    # nested child is rescanned until complete, add a scan stack if measured.
+    var scan_active: Bool
+    var scan_pos: Int
+    var scan_remaining: Int
     # arena as a Python bytearray: views over it keep it alive, and CPython
     # refuses to resize an exported buffer (see _ensure_cap)
     var buf_obj: Int
@@ -112,7 +119,11 @@ struct Reader(Defaultable, Movable, Writable):
         self.dec_enabled = False
         self.dec_encoding = 0
         self.dec_errors = 0
+        self.reply_error = 0
         self.needs_scan = False
+        self.scan_active = False
+        self.scan_pos = 0
+        self.scan_remaining = 0
         self.buf_obj = 0
         self.highway_slices = List[ResponseSlice]()
 
@@ -131,7 +142,7 @@ struct Reader(Defaultable, Movable, Writable):
             raise Error("feed() expects a buffer-protocol object")
         var n = Int(view.len)
         if n > 0:
-            if _arena_exports(self_ptr[]) > 0:
+            if _arena_pinned(self_ptr[]):
                 _arena_detach(self_ptr[], self_ptr[].buf_cap)
             _ensure_cap(self_ptr[], self_ptr[].buf_len + n)
             var dst = Pointer[UInt8, MutAnyOrigin](
@@ -147,10 +158,13 @@ struct Reader(Defaultable, Movable, Writable):
     def set_decoding(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], encoding: PythonObject, errors: PythonObject) raises -> PythonObject:
         """Cache codec C strings for in-core decoding.  PyUnicode_AsUTF8
         points into the str objects, which the wrapper keeps alive."""
-        var enc = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](
-            encoding.steal_data())
-        var errs = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](
-            errors.steal_data())
+        var enc_obj = encoding.steal_data()
+        var errs_obj = errors.steal_data()
+        var enc = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](enc_obj)
+        var errs = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](errs_obj)
+        # the wrapper keeps the str objects alive for the cached C strings
+        _ = Python().cpython().Py_DecRef(enc_obj)
+        _ = Python().cpython().Py_DecRef(errs_obj)
         self_ptr[].dec_encoding = Int(enc)
         self_ptr[].dec_errors = Int(errs)
         self_ptr[].dec_enabled = True
@@ -161,6 +175,22 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].dec_enabled = False
         self_ptr[].dec_encoding = 0
         self_ptr[].dec_errors = 0
+        return PythonObject(0)
+
+    @staticmethod
+    def set_reply_error(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], reply_error: PythonObject
+    ) raises -> PythonObject:
+        """Cache a zero-arg getter for the wrapper's replyError callable.
+
+        drain() used to steal the argument on every call, leaking one
+        reference to the callable per batch (measured +100 after 100 drains).
+        The wrapper passes a weakref getter so the Reader stays collectable.
+        """
+        ref cpy = Python().cpython()
+        if self_ptr[].reply_error != 0:
+            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].reply_error))
+        self_ptr[].reply_error = Int(reply_error.steal_data())
         return PythonObject(0)
 
     @staticmethod
@@ -181,8 +211,7 @@ struct Reader(Defaultable, Movable, Writable):
             # a previous chunk was incomplete: rebuild only once a scan says
             # the whole reply is buffered (chunked replies are otherwise
             # rebuilt from scratch on every chunk)
-            var sc = _scan_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
-            if sc.status == ST_INCOMPLETE:
+            if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
                 return _status_tuple(ST_INCOMPLETE, _none_payload())
         var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
         if node.status == ST_INCOMPLETE:
@@ -243,17 +272,17 @@ struct Reader(Defaultable, Movable, Writable):
             if self_ptr[].consumed >= self_ptr[].buf_len:
                 break
             if self_ptr[].needs_scan:
-                var sc = _scan_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
-                if sc.status == ST_INCOMPLETE:
+                var scan_status = _scan_needs(self_ptr[], ptr)
+                if scan_status == ST_INCOMPLETE:
                     break
                 self_ptr[].needs_scan = False
-                if sc.status == ST_PROTO_ERR:
+                if scan_status == ST_PROTO_ERR:
                     special = True
                     break
             var pos = self_ptr[].consumed
             var t = ptr.unsafe_offset(pos)[]
             # Containers and pushes have wrapper-specific finalization.
-            if t == TYPE_ARRAY or t == 62 or t == 37 or t == 126:
+            if t == TYPE_ARRAY or t == TYPE_ERROR or t == 62 or t == 37 or t == 126:
                 special = True
                 break
             var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
@@ -301,10 +330,17 @@ struct Reader(Defaultable, Movable, Writable):
             self_ptr[].buf_cap = 0
             self_ptr[].buf_len = 0
             self_ptr[].consumed = 0
+        self_ptr[].needs_scan = False
+        self_ptr[].scan_active = False
+        self_ptr[].scan_pos = 0
+        self_ptr[].scan_remaining = 0
+        if self_ptr[].reply_error != 0:
+            _ = Python().cpython().Py_DecRef(_int_ptr(self_ptr[].reply_error))
+            self_ptr[].reply_error = 0
         return PythonObject(0)
 
     @staticmethod
-    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject, reply_error: PythonObject) raises -> PythonObject:
+    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
         """Parse every complete reply currently buffered, into one list.
 
         Top-level error replies become replyError instances here: the wrapper's
@@ -315,7 +351,7 @@ struct Reader(Defaultable, Movable, Writable):
         """
         var collected = List[PyObjectPtr]()
         var sd = Int(py=should_decode)
-        var re_ptr = Int(reply_error.steal_data())
+        var re_ptr = self_ptr[].reply_error
         var raise_exc = _none_payload()
         var cnv = DecodeCtx(
             enabled=self_ptr[].dec_enabled and sd != 0,
@@ -329,9 +365,10 @@ struct Reader(Defaultable, Movable, Writable):
             var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
             var had_markers = False
             while True:
+                if self_ptr[].consumed >= self_ptr[].buf_len:
+                    break
                 if self_ptr[].needs_scan:
-                    var sc = _scan_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1)
-                    if sc.status == ST_INCOMPLETE:
+                    if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
                         break
                 var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
                 if node.status == ST_INCOMPLETE:
@@ -359,6 +396,8 @@ struct Reader(Defaultable, Movable, Writable):
                     if inst != 0:
                         collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
                             unsafe_from_address=inst)))
+                        _ = external_call["Py_DecRef", NoneType](
+                            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker))
                         continue
                     if Int(callback_error) != 0:
                         # Preserve the exception from the one callback invocation;
@@ -404,8 +443,6 @@ struct Reader(Defaultable, Movable, Writable):
         """
         ref cpy = Python().cpython()
         if self_ptr[].consumed >= self_ptr[].buf_len:
-            if self_ptr[].buf_obj == 0:
-                return _hw_tuple(_none_payload(), _none_payload(), _none_payload())
             return _hw_tuple(cpy.PyLong_FromSsize_t(ST_INCOMPLETE), _none_payload(), _none_payload())
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         var start = self_ptr[].consumed
@@ -421,7 +458,7 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].consumed = res.pos
         # Bound the arena like the classic path does, but only when no view is
         # alive: an exported bytearray must not be rewritten under its readers.
-        if self_ptr[].consumed == self_ptr[].buf_len and _arena_exports(self_ptr[]) == 0:
+        if self_ptr[].consumed == self_ptr[].buf_len and not _arena_pinned(self_ptr[]):
             self_ptr[].buf_len = 0
             self_ptr[].consumed = 0
         var n = len(self_ptr[].highway_slices)
@@ -504,18 +541,21 @@ def _arena_ptr(obj: Int) -> Pointer[UInt8, MutAnyOrigin]:
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=obj))
 
 
-def _arena_exports(r: Reader) -> Int:
-    """Number of live exports (memoryviews / numpy arrays) on the arena.
+def _arena_pinned(r: Reader) -> Bool:
+    """True when the arena is referenced outside this Reader.
 
-    Reads ob_exports at offset 48 of PyByteArrayObject: CPython's documented
-    layout (var head 24 bytes, ob_alloc, ob_bytes, ob_start, ob_exports) and
-    unchanged across 3.9-3.13, checked against ctypes on 3.12.  A probe via
-    PyByteArray_Resize cannot be used: a same-size resize is a no-op even when
-    the buffer is exported.
+    That covers memoryviews/numpy arrays *and* the bare bytearray handed to
+    highway_gets() callers.  ob_refcnt sits at offset 0 of every PyObject on
+    standard (GIL) CPython builds; this field is the single baseline
+    reference.  ob_exports (offset 48 of PyByteArrayObject on 3.9-3.13) is
+    kept as a belt-and-braces check for exported buffers.
     """
     if r.buf_obj == 0:
-        return 0
-    return Int(Pointer[Int, MutAnyOrigin](unsafe_from_address=r.buf_obj + 48)[])
+        return False
+    var refcnt = Int(Pointer[Int, MutAnyOrigin](unsafe_from_address=r.buf_obj)[])
+    if refcnt > 1:
+        return True
+    return Int(Pointer[Int, MutAnyOrigin](unsafe_from_address=r.buf_obj + 48)[]) > 0
 
 
 def _arena_detach(mut r: Reader, want_cap: Int) raises:
@@ -536,6 +576,9 @@ def _arena_detach(mut r: Reader, want_cap: Int) raises:
     r.buf_cap = cap
     r.buf_len = pending
     r.consumed = 0
+    r.scan_active = False
+    r.scan_pos = 0
+    r.scan_remaining = 0
     r.buf_addr = Int(_arena_ptr(r.buf_obj))
 
 
@@ -550,7 +593,7 @@ def _ensure_cap(mut r: Reader, needed: Int) raises:
         r.buf_cap = new_cap
         r.buf_addr = Int(_arena_ptr(r.buf_obj))
         return
-    if _arena_exports(r) > 0:
+    if _arena_pinned(r):
         # a live view pins the old arena: continue in a fresh one
         _arena_detach(r, new_cap)
         return
@@ -571,12 +614,27 @@ def _compact(mut r: Reader) -> Bool:
     if r.consumed == r.buf_len:
         r.buf_len = 0
         r.consumed = 0
+        r.scan_active = False
+        r.scan_pos = 0
+        r.scan_remaining = 0
+        # released an oversized arena instead of pinning it for the life of
+        # the reader (hiredis frees an empty buffer larger than maxbuf)
+        if r.buf_cap > 16384 and not _arena_pinned(r):
+            var rc = external_call["PyByteArray_Resize", c_int](
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj), c_ssize_t(16384))
+            if rc == 0:
+                r.buf_cap = 16384
+                r.buf_addr = Int(_arena_ptr(r.buf_obj))
+            else:
+                _ = Python().cpython().PyErr_Clear()
         return False
     if r.consumed * 2 >= r.buf_len and r.buf_len > 1024:
         var dst = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr)
         var src = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr + r.consumed)
         _ = external_call["memmove", Pointer[UInt8, MutAnyOrigin]](
             dst, src, c_size_t(r.buf_len - r.consumed))
+        if r.scan_active:
+            r.scan_pos -= r.consumed
         r.buf_len -= r.consumed
         r.consumed = 0
         return True
@@ -584,6 +642,11 @@ def _compact(mut r: Reader) -> Bool:
 
 
 # === Result helpers ===
+
+def _int_ptr(value: Int) -> PyObjectPtr:
+    """Wrap a raw PyObject* address as a non-owning PyObjectPtr."""
+    return PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=value))
+
 
 def _none_payload() -> PyObjectPtr:
     # callers wrap this with from_owned, so hand over an owned reference
@@ -709,9 +772,22 @@ def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -
     preserving the original exception and traceback for the Python wrapper.
     """
     ref cpy = Python().cpython()
+    # re_ptr holds a zero-arg weakref getter (see set_reply_error): the core
+    # must not keep the wrapper's callable alive, or reader/callable cycles
+    # become invisible to the cyclic GC (the Mojo type has no tp_traverse)
+    var callable = external_call["PyObject_CallNoArgs", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr))
+    if Int(callable) == 0:
+        raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
+        return 0
+    if Int(callable) == Int(cpy.Py_None()):
+        # dead weakref: drain falls back to the wrapper's own callable
+        _ = cpy.Py_DecRef(callable)
+        return 0
     var msg = external_call["PyTuple_GetItem", PyObjectPtr](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker_ptr), c_ssize_t(1))
     if Int(msg) == 0:
+        _ = cpy.Py_DecRef(callable)
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
     # hiredis hands error text over as str, always (utf-8/"replace")
@@ -724,17 +800,20 @@ def _marker_to_instance(re_ptr: Int, marker_ptr: Int, mut raised: PyObjectPtr) -
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(enc.unsafe_ptr())),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(errs.unsafe_ptr())))
     if Int(text) == 0:
+        _ = cpy.Py_DecRef(callable)
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
     var args = cpy.PyTuple_New(1)
     if Int(args) == 0:
         _ = cpy.Py_DecRef(text)
+        _ = cpy.Py_DecRef(callable)
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
     _ = cpy.PyTuple_SetItem(args, 0, text)
     var inst = external_call["PyObject_CallObject", PyObjectPtr](
-        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=re_ptr),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(callable)),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(args)))
+    _ = cpy.Py_DecRef(callable)
     _ = cpy.Py_DecRef(args)
     if Int(inst) == 0:
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
@@ -752,6 +831,21 @@ def _error_marker(msg_ptr: Pointer[UInt8, MutAnyOrigin], length: Int) raises -> 
 
 
 # === RESP parsing ===
+
+def _bignum_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
+    """hiredis accepts an optional '-' followed by at least one digit."""
+    var i = start
+    if i < crlf and ptr.unsafe_offset(i)[] == 45:  # '-'
+        i += 1
+    if i >= crlf:
+        return False
+    while i < crlf:
+        var c = Int(ptr.unsafe_offset(i)[])
+        if c < 48 or c > 57:
+            return False
+        i += 1
+    return True
+
 
 def _find_crlf(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) -> Int:
     var p = ptr.unsafe_offset(start)
@@ -909,18 +1003,31 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
         if blen == -1:
             return ScanResult(ST_OK, after_int)
         var pstart = after_int
-        if pstart + blen + 2 > end:
+        if blen > end - pstart - 2:
             return ScanResult(ST_INCOMPLETE, start)
         return ScanResult(ST_OK, pstart + blen + 2)
-    if t == TYPE_ARRAY or t == 62:  # '*' or '>'
+    if t == 40:  # '(' big number
+        var crlf = _find_crlf(ptr, start + 1, end)
+        if crlf < 0:
+            return ScanResult(ST_INCOMPLETE, start)
+        if not _bignum_ok(ptr, start + 1, crlf):
+            return ScanResult(ST_PROTO_ERR, start)
+        return ScanResult(ST_OK, crlf + 2)
+    if t == TYPE_ARRAY or t == 62 or t == 124:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
-        if status == ST_PROTO_ERR or count < -1:
+        if status == ST_PROTO_ERR:
             return ScanResult(ST_PROTO_ERR, start)
-        if count == -1:
+        if t == 124:
+            if count < 0:
+                return ScanResult(ST_PROTO_ERR, start)
+            count *= 2
+        elif count < -1:
+            return ScanResult(ST_PROTO_ERR, start)
+        elif count == -1:
             return ScanResult(ST_OK, after_int)
         if depth > MAX_DEPTH:
             return ScanResult(ST_PROTO_ERR, start)
@@ -964,7 +1071,7 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
         if status == ST_PROTO_ERR or vlen < 0:
             return ScanResult(ST_PROTO_ERR, start)
         var pstart = after_int
-        if pstart + vlen + 2 > end:
+        if vlen > end - pstart - 2:
             return ScanResult(ST_INCOMPLETE, start)
         return ScanResult(ST_OK, pstart + vlen + 2)
     if t == 126:  # '~' set
@@ -1019,6 +1126,60 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
     return ScanResult(ST_PROTO_ERR, start)
 
 
+def _scan_resume(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
+    """Resumable completeness scan for a top-level array/push reply.
+
+    Progress commits at child boundaries, so a chunked feed rescans only the
+    one child spanning the chunk boundary instead of the whole reply; without
+    this the chunked rewrite is O(n^2) in the reply size (measured: 4 KiB
+    chunks over a 20k-element array were 50x slower than hiredis).
+    """
+    if r.scan_active and r.scan_pos < r.consumed:
+        r.scan_active = False
+    if not r.scan_active:
+        var after_int = r.consumed + 1
+        var status: UInt8 = ST_OK
+        var count = _read_int(ptr, r.consumed + 1, r.buf_len, after_int, status)
+        if status == ST_INCOMPLETE:
+            return ST_INCOMPLETE
+        if status == ST_PROTO_ERR or count < -1:
+            return ST_PROTO_ERR
+        if count == -1:
+            return ST_OK
+        r.scan_pos = after_int
+        r.scan_remaining = count
+        r.scan_active = True
+    while r.scan_remaining > 0:
+        var child = _scan_node(ptr, r.scan_pos, r.buf_len, 2)
+        if child.status == ST_PROTO_ERR:
+            r.scan_active = False
+            return ST_PROTO_ERR
+        if child.status == ST_INCOMPLETE:
+            return ST_INCOMPLETE
+        r.scan_pos = child.pos
+        r.scan_remaining -= 1
+    r.scan_active = False
+    return ST_OK
+
+
+def _scan_needs(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
+    """Scan the pending reply when a previous build came back incomplete."""
+    if r.consumed >= r.buf_len:
+        return ST_INCOMPLETE
+    var t = ptr.unsafe_offset(r.consumed)[]
+    var status: UInt8 = ST_OK
+    if t == TYPE_ARRAY or t == 62:
+        status = _scan_resume(r, ptr)
+    else:
+        var sc = _scan_node(ptr, r.consumed, r.buf_len, 1)
+        status = sc.status
+    if status != ST_INCOMPLETE:
+        r.scan_active = False
+        r.scan_pos = 0
+        r.scan_remaining = 0
+    return status
+
+
 def _parse_node(
     ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int, mut cnv: DecodeCtx
 ) raises -> Node:
@@ -1060,12 +1221,19 @@ def _parse_node(
         if blen == -1:
             return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
         var pstart = after_int
-        if pstart + blen + 2 > end:
+        if blen > end - pstart - 2:  # no overflow for blen near Int.MAX
             return _incomplete_node(start)
         # hiredis does not validate the trailing CRLF after a bulk payload;
         # it consumes payload + 2 bytes unconditionally (verified 3.4.2)
         return Node(ST_OK, pstart + blen + 2, PythonObject(from_owned=_leaf_payload(ptr, pstart, blen, cnv)))
-    if t == TYPE_ARRAY or t == 62:  # '*' or '>' (push)
+    if t == 40:  # '(' big number: digits until CRLF, returned as bytes
+        var crlf = _find_crlf(ptr, start + 1, end)
+        if crlf < 0:
+            return _incomplete_node(start)
+        if not _bignum_ok(ptr, start + 1, crlf):
+            return _proto_node(start, "Bad bignum value")
+        return Node(ST_OK, crlf + 2, PythonObject(from_owned=_leaf_payload(ptr, start + 1, crlf - (start + 1), cnv)))
+    if t == TYPE_ARRAY or t == 62 or t == 124:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
@@ -1073,9 +1241,14 @@ def _parse_node(
             return _incomplete_node(start)
         if status == ST_PROTO_ERR:
             return _proto_node(start, "Bad multi-bulk length")
-        if count < -1:
+        if t == 124:
+            # attributes flatten N key/value pairs into one list (hiredis-py)
+            if count < 0:
+                return _proto_node(start, "Bad attribute length")
+            count *= 2
+        elif count < -1:
             return _proto_node(start, "Multi-bulk length out of range")
-        if count == -1:
+        elif count == -1:
             return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
         if depth > MAX_DEPTH:
             return _proto_node(start, "Max nesting depth exceeded")
@@ -1091,6 +1264,10 @@ def _parse_node(
             # real reply (MGET/LRANGE/HGETALL/SMEMBERS).  A recursive
             # _parse_node call plus its Node costs ~20ns per element
             # (measured), and most elements are one of these three types.
+            if pos >= end:
+                # the previous element consumed exactly to the chunk end
+                _ = cpy.Py_DecRef(list_obj)
+                return _incomplete_node(start)
             var t2 = ptr.unsafe_offset(pos)[]
             if t2 == TYPE_BULK:
                 var after2 = pos + 1
@@ -1152,6 +1329,9 @@ def _parse_node(
             if child.status == ST_PROTO_ERR:
                 _ = cpy.Py_DecRef(list_obj)
                 return _proto_node(start, child.err_msg)
+            if child.status == ST_DICT_ERR:
+                _ = cpy.Py_DecRef(list_obj)
+                return child^
             if child.had_err:
                 saw_err = True
             _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
@@ -1195,7 +1375,7 @@ def _parse_node(
         if status == ST_PROTO_ERR or vlen < 0:
             return _proto_node(start, "Bad verbatim string length")
         var pstart = after_int
-        if pstart + vlen + 2 > end:
+        if vlen > end - pstart - 2:
             return _incomplete_node(start)
         var colon = _find_byte(ptr, pstart, pstart + vlen, 58)
         var vpos = pstart + vlen
@@ -1228,6 +1408,9 @@ def _parse_node(
             if child2.status == ST_PROTO_ERR:
                 _ = cpy3.Py_DecRef(set_list)
                 return _proto_node(start, child2.err_msg)
+            if child2.status == ST_DICT_ERR:
+                _ = cpy3.Py_DecRef(set_list)
+                return child2^
             if child2.had_err:
                 saw_err2 = True
             _ = cpy3.PyList_SetItem(set_list, i2, child2.payload.steal_data())
@@ -1259,6 +1442,9 @@ def _parse_node(
             if key_node.status == ST_PROTO_ERR:
                 _ = cpy4.Py_DecRef(dict_obj)
                 return _proto_node(start, key_node.err_msg)
+            if key_node.status == ST_DICT_ERR:
+                _ = cpy4.Py_DecRef(dict_obj)
+                return key_node^
             if key_node.had_err:
                 saw_err3 = True
             mpos = key_node.pos
@@ -1269,6 +1455,9 @@ def _parse_node(
             if val_node.status == ST_PROTO_ERR:
                 _ = cpy4.Py_DecRef(dict_obj)
                 return _proto_node(start, val_node.err_msg)
+            if val_node.status == ST_DICT_ERR:
+                _ = cpy4.Py_DecRef(dict_obj)
+                return val_node^
             if val_node.had_err:
                 saw_err3 = True
             mpos = val_node.pos
@@ -1282,7 +1471,7 @@ def _parse_node(
                 # unhashable key etc: clear the CPython error, signal the wrapper
                 cpy4.PyErr_Clear()
                 _ = cpy4.Py_DecRef(dict_obj)
-                return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=cpy4.Py_None()))
+                return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=_none_payload()))
         var map_node = Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
         map_node.had_err = saw_err3
         return map_node^
@@ -1366,11 +1555,19 @@ def _scan_highway(
         if blen == -1:
             return ScanResult(ST_OK, after_int)
         var pstart = after_int
-        if pstart + blen + 2 > end:
+        if blen > end - pstart - 2:
             return ScanResult(ST_INCOMPLETE, start)
         _record_slice(slices, pstart - base, blen, TYPE_BULK)
         return ScanResult(ST_OK, pstart + blen + 2)
-    if t == TYPE_ARRAY or t == 62:  # '*' or '>'
+    if t == 40:  # '(' big number: record the digits slice
+        var crlf = _find_crlf(ptr, start + 1, end)
+        if crlf < 0:
+            return ScanResult(ST_INCOMPLETE, start)
+        if not _bignum_ok(ptr, start + 1, crlf):
+            return ScanResult(ST_PROTO_ERR, start, String("Bad bignum value"))
+        _record_slice(slices, start + 1 - base, crlf - (start + 1), t)
+        return ScanResult(ST_OK, crlf + 2)
+    if t == TYPE_ARRAY or t == 62 or t == 124:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
@@ -1378,9 +1575,13 @@ def _scan_highway(
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
             return ScanResult(ST_PROTO_ERR, start, String("Bad multi-bulk length"))
-        if count < -1:
+        if t == 124:
+            if count < 0:
+                return ScanResult(ST_PROTO_ERR, start, String("Bad attribute length"))
+            count *= 2
+        elif count < -1:
             return ScanResult(ST_PROTO_ERR, start, String("Multi-bulk length out of range"))
-        if count == -1:
+        elif count == -1:
             return ScanResult(ST_OK, after_int)
         if depth > MAX_DEPTH:
             return ScanResult(ST_PROTO_ERR, start, String("Max nesting depth exceeded"))
@@ -1444,7 +1645,7 @@ def _scan_highway(
         if status4 == ST_PROTO_ERR or vlen < 0:
             return ScanResult(ST_PROTO_ERR, start, String("Bad verbatim string length"))
         var pstart4 = after_int4
-        if pstart4 + vlen + 2 > end:
+        if vlen > end - pstart4 - 2:
             return ScanResult(ST_INCOMPLETE, start)
         var colon = _find_byte(ptr, pstart4, pstart4 + vlen, 58)
         var vpos = pstart4 + vlen
@@ -1496,6 +1697,7 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_method[Reader.prefetch_clean]("prefetch_clean") \
             .def_method[Reader.free]("free") \
             .def_method[Reader.set_decoding]("set_decoding") \
+            .def_method[Reader.set_reply_error]("set_reply_error") \
             .def_method[Reader.clear_decoding]("clear_decoding") \
             .def_method[Reader.drain]("drain") \
             .def_method[Reader.buffered]("buffered") \

@@ -9,17 +9,32 @@ Mirrors `hiredis.Reader` semantics verified against hiredis 3.4.2:
 """
 
 import codecs
+import weakref
 
 from . import hpredis_core as _core
 
 _ERR_SENTINEL = b"\x00hpredis-error\x00"
 
+__all__ = [
+    "HiredisError",
+    "ProtocolError",
+    "ReplyError",
+    "PushNotification",
+    "Reader",
+    "pack_command",
+]
+__version__ = "0.1.0"
 
-class ProtocolError(Exception):
+
+class HiredisError(Exception):
+    """Base class for reader errors (hiredis-py parity)."""
+
+
+class ProtocolError(HiredisError):
     pass
 
 
-class ReplyError(Exception):
+class ReplyError(HiredisError):
     pass
 
 
@@ -56,10 +71,25 @@ class Reader:
         self._errors = errors
         self._notEnoughData = notEnoughData
         self._highway = highway_mode
-        self._maxbuf = 0
+        self._maxbuf = 16384  # hiredis' default
         self._closed = False
         self._dec_errors = None
+        # True when the core reported no complete reply; no bytes can appear
+        # before the next feed(), so gets()/has_data() can answer without a
+        # core call (redis-py polls both between reads)
+        self._exhausted = True
         self._sync_decoding()
+        re = self._replyError
+        if getattr(re, "__self__", None) is not None:
+            re_get = weakref.WeakMethod(re)
+        else:
+            try:
+                re_get = weakref.ref(re)
+            except TypeError:
+                # callables without weakref support: keep a strong proxy
+                re_get = lambda: re
+        self._reply_get = re_get
+        self._core.set_reply_error(re_get)
 
     def feed(self, data, start=None, stop=None):
         """Feed bytes/bytearray/memoryview. (data, start, stop) slices a buffer."""
@@ -68,6 +98,8 @@ class Reader:
         if start is not None or stop is not None:
             # hiredis feed(data, start, length): third arg is a LENGTH
             n = len(data)
+            if start is None:
+                start = 0
             if start < 0 or start > n:
                 raise ValueError("invalid offset")
             if stop is None:
@@ -81,6 +113,8 @@ class Reader:
                 # memoryview objects entirely
                 data = memoryview(data)[start : start + stop]
         self._core.feed(data)
+        self._exhausted = False
+        self._closed = False
 
     def gets(self, should_decode=True):
         """Get one reply. The flag is hiredis-py's `shouldDecode`: it
@@ -88,6 +122,8 @@ class Reader:
         (redis-py's disable_decoding path calls gets(False))."""
         if self._highway:
             return self._highway_gets()
+        if self._exhausted and self._pending_index >= self._pending_count:
+            return self._notEnoughData
         if self._pending_index >= self._pending_count and self._encoding is None:
             prefetched = self._core.prefetch_clean()
             if type(prefetched) is not tuple:
@@ -97,6 +133,7 @@ class Reader:
                 self._pending_count = len(self._pending)
                 self._pending_index = 0
             elif prefetched[0] == 1:
+                self._exhausted = True
                 return self._notEnoughData
         if self._pending_index < self._pending_count:
             index = self._pending_index
@@ -115,6 +152,7 @@ class Reader:
             return result
         status, payload = result
         if status == 1:
+            self._exhausted = True
             return self._notEnoughData
         if status == 6:
             # error markers inside the reply: _finalize builds replyError
@@ -132,7 +170,8 @@ class Reader:
         if status == 3:
             return self._replyError(self._decode_msg(payload[1]))
         if status == 4:
-            return PushNotification(payload)
+            # pushes can carry nested error markers too
+            return PushNotification(self._finalize(payload, should_decode))
         raise TypeError("unhashable type in map reply")  # status 5
 
     def _clear_pending(self):
@@ -156,7 +195,7 @@ class Reader:
         if pending_replies:
             self._clear_pending()
         replies, proto_msg, dict_err, had_markers, dec_failed, raise_exc = self._core.drain(
-            1 if should_decode else 0, self._replyError
+            1 if should_decode else 0
         )
         if dict_err:
             raise TypeError("unhashable type in map reply")
@@ -210,7 +249,7 @@ class Reader:
     def setmaxbuf(self, value):
         """Store hiredis' max-buffer setting; enforcement is not implemented."""
         if value is None:
-            value = 0  # default: unlimited
+            value = 16384  # hiredis resets to its default buffer size
         if not isinstance(value, int):
             raise TypeError("setmaxbuf() expects an int or None")
         if value < 0:
@@ -221,9 +260,6 @@ class Reader:
         return self._maxbuf
 
     def len(self):
-        return sum(self._pending_lengths[self._pending_index : self._pending_count]) + self._core.buffered()
-
-    def __len__(self):
         return sum(self._pending_lengths[self._pending_index : self._pending_count]) + self._core.buffered()
 
     def has_data(self):
@@ -278,6 +314,11 @@ class Reader:
             return self._replyError(self._decode_msg(obj[1]))
         if isinstance(obj, list):
             return [self._finalize(x, should_decode) for x in obj]
+        if isinstance(obj, dict):
+            return {
+                self._finalize(k, should_decode): self._finalize(v, should_decode)
+                for k, v in obj.items()
+            }
         if (
             isinstance(obj, bytes)
             and self._encoding is not None
@@ -301,5 +342,7 @@ def pack_command(args):
             arg = str(arg).encode()
         else:
             raise TypeError(f"invalid command argument type: {type(arg)!r}")
-        parts.append(b"$%d\r\n" % len(arg) + arg + b"\r\n")
+        parts.append(b"$%d\r\n" % len(arg))
+        parts.append(arg)
+        parts.append(b"\r\n")
     return b"".join(parts)

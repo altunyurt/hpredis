@@ -212,6 +212,23 @@ def test_chunked_feeding_matches_single_feed(chunk, use_gets):
     assert repr(_drain_chunked(payload, chunk, use_gets)) == repr(want)
 
 
+def test_chunked_gets_resumes_large_array_scan():
+    count = 20_000
+    leaf = b"$64\r\n" + b"x" * 64 + b"\r\n"
+    payload = b"*%d\r\n" % count + leaf * count
+    r = reader()
+    result = False
+    for off in range(0, len(payload), 4096):
+        r.feed(payload[off : off + 4096])
+        value = r.gets(False)
+        if value is not False:
+            result = value
+    assert len(result) == count
+    assert result[0] == b"x" * 64
+    assert result[-1] == b"x" * 64
+    assert r.gets() is False
+
+
 def test_chunked_large_array_matches_single_feed():
     payload = b"*2000\r\n" + (b"$8\r\n" + b"x" * 8 + b"\r\n") * 2000
     one = hpredis.Reader()
@@ -308,7 +325,7 @@ def test_gets_prefetch_keeps_partial_tail_for_next_feed():
     assert r.gets() == b"partial"
     assert r.gets() == b"two"
     assert r.gets() is False
-    assert len(r) == 0
+    assert r.len() == 0
 
 
 def test_gets_prefetch_does_not_run_reply_error_early():
@@ -344,6 +361,101 @@ def test_core_gets_returns_clean_reply_without_status_tuple():
     r = reader()
     r.feed(b"+OK\r\n")
     assert r._core.try_gets(0) == b"OK"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"$9223372036854775807\r\n",
+        b"=9223372036854775807\r\n",
+    ],
+)
+def test_huge_length_header_does_not_crash(payload):
+    # before the overflow-safe check `pstart + blen + 2 > end` wrapped
+    # negative for Int64-sized lengths and the parse segfaulted
+    r = reader()
+    r.feed(payload)
+    assert r.gets(False) is False
+
+
+def test_resp3_bignum_and_attribute_match_hiredis():
+    for payload in (
+        b"(3492890328409238509324850943850943825024385\r\n",
+        b"(9223372036854775807\r\n",
+        b"(123\r\n",
+        b"|1\r\n+key-popularity\r\n,1.0\r\n",
+    ):
+        results = []
+        for mod in (hiredis, hpredis):
+            r = mod.Reader()
+            r.feed(payload)
+            results.append(r.gets(False))
+        assert repr(results[0]) == repr(results[1])
+
+
+def test_nested_unhashable_map_key_raises_type_error():
+    r = reader()
+    r.feed(b"*1\r\n%1\r\n*1\r\n:1\r\n$1\r\nv\r\n")
+    with pytest.raises(TypeError):
+        r.gets(False)
+
+
+def test_map_value_error_marker_is_finalized():
+    r = reader()
+    r.feed(b"%1\r\n+key\r\n-ERR inner\r\n")
+    out = r.gets()
+    assert isinstance(out[b"key"], hpredis.ReplyError)
+    assert out[b"key"].args[0] == "ERR inner"
+
+
+def test_push_with_nested_error_is_a_notification_of_errors():
+    r = reader()
+    r.feed(b">1\r\n-ERR pushed\r\n")
+    out = r.gets()
+    assert isinstance(out, hpredis.PushNotification)
+    assert isinstance(out[0], hpredis.ReplyError)
+
+
+def test_set_encoding_and_drain_do_not_leak_references():
+    enc = "".join(["ut", "f-", "8"])
+    r = hpredis.Reader()
+    base = sys.getrefcount(enc)
+    for _ in range(50):
+        r.set_encoding(enc)
+    # the active encoding is held exactly once by the wrapper
+    assert sys.getrefcount(enc) == base + 1
+
+    def parse_error(msg):
+        return hpredis.ReplyError(msg)
+
+    r = hpredis.Reader(replyError=parse_error)
+    base = sys.getrefcount(parse_error)
+    r.feed(b"+OK\r\n")
+    for _ in range(50):
+        r.drain()
+    assert sys.getrefcount(parse_error) == base
+
+
+def test_highway_empty_buffer_returns_not_enough_data():
+    r = hpredis.Reader(highway_mode=True)
+    assert r.gets() is False
+
+
+def test_maxbuf_defaults_and_reset_match_hiredis():
+    assert hiredis.Reader().getmaxbuf() == hpredis.Reader().getmaxbuf() == 16384
+    r = hpredis.Reader()
+    r.setmaxbuf(100)
+    assert r.getmaxbuf() == 100
+    r.setmaxbuf(None)
+    assert r.getmaxbuf() == 16384
+
+
+def test_exports_and_error_hierarchy_match_hiredis():
+    assert issubclass(hpredis.ProtocolError, hpredis.HiredisError)
+    assert issubclass(hpredis.ReplyError, hpredis.HiredisError)
+    assert not hasattr(hpredis.Reader, "__len__")  # hiredis has no __len__
+    assert hpredis.__version__
+    assert "Reader" in hpredis.__all__
 
 
 # --- drain(): error replies built in the core ------------------------------
