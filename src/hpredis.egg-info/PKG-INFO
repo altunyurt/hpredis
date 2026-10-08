@@ -82,8 +82,9 @@ Python bytes ──feed──► Mojo-managed bytearray arena
 
 - Per-reply `gets()` is slower for tiny responses; `drain()` batches buffered
   replies and is faster for pipeline workloads
-- Highway Mode exposes flattened byte slices, not nested Python reply objects;
-  it is intended for native consumers
+- Highway Mode exposes a pre-order table, not nested Python reply objects:
+  payload slices, `length = -1` for nil, and a header row (child count) per
+  container; it is intended for native consumers
 - `setmaxbuf()` stores the hiredis-compatible value but does not enforce it
 - Highway views keep their arena alive across feeds; the reader detaches rather
   than overwriting bytes that are still viewed

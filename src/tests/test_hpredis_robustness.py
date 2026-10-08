@@ -63,6 +63,22 @@ def test_error_replies_batch_like_scalars():
     assert isinstance(second, hpredis.ReplyError) and second.args[0] == "ERR two"
 
 
+def test_reader_release_frees_cached_references():
+    def parse_error(msg):
+        return hpredis.ReplyError(msg)
+
+    baseline = sys.getrefcount(parse_error)
+    r = hpredis.Reader(replyError=parse_error)
+    r.feed(b"+OK\r\n")
+    assert r.gets() == b"OK"
+    for _ in range(100):  # exercises the cached incomplete tuple
+        status, payload = r._core.try_gets(0)
+        assert status == 1 and payload is None
+    del r
+    gc.collect()
+    assert sys.getrefcount(parse_error) == baseline
+
+
 def test_error_replies_do_not_leak():
     r = reader()
 
@@ -657,6 +673,17 @@ def test_drain_reports_a_raising_reply_error_and_stays_consistent():
     assert calls == ["ERR one", "ERR one"]
     # the raising drain consumed the error reply; the rest is pending
     assert r.gets() == b"NEXT"
+
+
+def test_drain_max_replies_caps_the_batch():
+    r = hpredis.Reader()
+    r.feed(b"+a\r\n" * 10)
+    assert r.drain(max_replies=3) == [b"a"] * 3
+    assert r.drain(max_replies=3) == [b"a"] * 3
+    assert r.drain(max_replies=100) == [b"a"] * 4
+    assert r.drain() == []
+    with pytest.raises(ValueError):
+        r.drain(max_replies=-1)
 
 
 def test_drain_delivers_replies_before_a_protocol_error():

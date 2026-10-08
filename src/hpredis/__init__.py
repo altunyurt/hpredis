@@ -61,6 +61,7 @@ class Reader:
         self._pending_lengths = []
         self._pending_index = 0
         self._pending_count = 0
+        self._pending_bytes = 0
         if not callable(protocolError if protocolError is not None else ProtocolError):
             raise TypeError("protocolError must be callable")
         if not callable(replyError if replyError is not None else ReplyError):
@@ -152,6 +153,7 @@ class Reader:
                 _, self._pending, self._pending_lengths = prefetched
                 self._pending_count = len(self._pending)
                 self._pending_index = 0
+                self._pending_bytes = sum(self._pending_lengths)
             elif prefetched[0] == 1:
                 self._exhausted = True
                 return self._notEnoughData
@@ -161,6 +163,7 @@ class Reader:
             index = self._pending_index
             reply = self._pending[index]
             self._pending_index = index + 1
+            self._pending_bytes -= self._pending_lengths[index]
             if self._pending_index == self._pending_count:
                 self._clear_pending()
             if self._encoding is not None and should_decode:
@@ -206,23 +209,28 @@ class Reader:
         self._pending_lengths = []
         self._pending_index = 0
         self._pending_count = 0
+        self._pending_bytes = 0
 
-    def drain(self, should_decode=True):
+    def drain(self, should_decode=True, max_replies=0):
         """Parse every complete reply already buffered and return them as a
         list, in one core call.  A `while r.gets() is not False: ...` loop
         pays the Mojo<->CPython boundary per reply; drain pays it once.
 
+        max_replies > 0 caps the batch size (the rest stays buffered), so a
+        100 MB buffer does not have to become one list.
         Stops at an incomplete tail, which stays buffered for the next feed.
         A malformed reply raises protocolError and is sticky, as with gets().
         Not available in highway mode (drain may compact the shared buffer).
         """
         if self._highway:
             raise RuntimeError("drain() is not available in highway mode")
+        if not isinstance(max_replies, int) or max_replies < 0:
+            raise ValueError("max_replies must be a non-negative int")
         pending_replies = self._pending[self._pending_index : self._pending_count]
         if pending_replies:
             self._clear_pending()
         replies, proto_msg, dict_exc, had_markers, dec_failed, raise_exc = self._core.drain(
-            1 if should_decode else 0
+            1 if should_decode else 0, max_replies
         )
         if dict_exc is not None:
             raise dict_exc
@@ -248,10 +256,13 @@ class Reader:
 
         table is n*24 bytes of little-endian int64 triples
         (offset, length, resp_type) with offsets into arena, which is the
-        bytearray holding the reply.  Read the table in one call:
+        bytearray holding the reply.  Rows are pre-order: byte payloads are
+        slices, nil is length -1, bool carries its 't'/'f' byte, and
+        containers emit a header row (length = child count) before their
+        children.  Read the table in one call:
             triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
         then read payloads directly from arena:
-            off, length, typ = triples[i]
+            off, length, typ = triples[0]  # single bulk: one payload row
             arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
         A view of the arena owns its data: it stays valid across feeds (the
         core moves to a fresh arena instead of resizing an exported one).
@@ -293,7 +304,7 @@ class Reader:
         return self._maxbuf
 
     def len(self):
-        return sum(self._pending_lengths[self._pending_index : self._pending_count]) + self._core.buffered()
+        return self._pending_bytes + self._core.buffered()
 
     def has_data(self):
         """redis-py 8 can_read() support."""
@@ -308,9 +319,11 @@ class Reader:
             core.free()
 
     def __del__(self):
-        # the arena is raw C memory the Mojo struct does not own: without this
-        # every collected Reader leaks its buffer (measured +250MB/2000 readers)
-        self.close()
+        # release the arena and the cached Python references; close() is the
+        # public, reusable API
+        core = getattr(self, "_core", None)
+        if core is not None:
+            core.dispose()
 
     def _sync_decoding(self):
         """Push the codec configuration into the core, which decodes string
@@ -320,7 +333,16 @@ class Reader:
             self._core.clear_decoding()
         else:
             self._dec_errors = self._errors if self._errors is not None else "strict"
-            self._core.set_decoding(self._encoding, self._dec_errors)
+            name = codecs.lookup(self._encoding).name
+            if name == "utf-8":
+                kind = 1
+            elif name in ("latin-1", "iso8859-1"):
+                kind = 2
+            elif name == "ascii":
+                kind = 3
+            else:
+                kind = 0  # generic PyUnicode_Decode with the codec lookup
+            self._core.set_decoding(self._encoding, self._dec_errors, kind)
 
     def _raise_decode_error(self, obj):
         """A leaf failed strict decoding in the core; the undecoded bytes

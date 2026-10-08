@@ -122,24 +122,57 @@ def test_real_statuses():
     r = hpredis.Reader(highway_mode=True)
     r.feed(b"*2\r\n$3\r\nfoo\r\n:42\r\n$3\r\npa")
     table, arena = r.gets()
-    # "*2\r\n$3\r\nfoo\r\n:42\r\n": payload "foo" at 8, text "42" at 14
-    assert [(o, l, chr(t)) for o, l, t in _slices(table)] == [(8, 3, "$"), (14, 2, ":")]
+    # array header, payload "foo" at 8, text "42" at 14
+    assert [(o, l, chr(t)) for o, l, t in _slices(table)] == [
+        (0, 2, "*"),
+        (8, 3, "$"),
+        (14, 2, ":"),
+    ]
     assert r.gets() is False  # the partial bulk is not a reply yet
     r.feed(b"r\r\n")
     table, arena = r.gets()
     assert bytes(arena[_slices(table)[0][0] : _slices(table)[0][0] + 3]) == b"par"
 
-    # RESP3 containers are byte slices, not "no data yet"
+    # container rows are typed headers, not "no data yet"
     r = hpredis.Reader(highway_mode=True)
     r.feed(b"%1\r\n$1\r\nk\r\n$1\r\nv\r\n")
     table, arena = r.gets()
-    assert [chr(t) for _o, _l, t in _slices(table)] == ["$", "$"]
+    assert [(o, l, chr(t)) for o, l, t in _slices(table)] == [
+        (0, 2, "%"),
+        (8, 1, "$"),
+        (15, 1, "$"),
+    ]
 
     # unknown type byte is a protocol error, not an incomplete reply
     r = hpredis.Reader(highway_mode=True)
     r.feed(b"?bad\r\n")
     with pytest.raises(hpredis.ProtocolError):
         r.gets()
+
+
+def test_highway_nil_and_container_rows_align():
+    # a missing MGET element is a -1 row, so later rows cannot shift up
+    r = hpredis.Reader(highway_mode=True)
+    r.feed(b"*3\r\n$1\r\na\r\n$-1\r\n$1\r\nc\r\n")
+    table, arena = r.gets()
+    assert [(o, l, chr(t)) for o, l, t in _slices(table)] == [
+        (0, 3, "*"),
+        (8, 1, "$"),
+        (11, -1, "$"),
+        (20, 1, "$"),
+    ]
+
+
+def test_highway_bool_null_and_double_rows():
+    r = hpredis.Reader(highway_mode=True)
+    r.feed(b"*3\r\n#t\r\n_\r\n,1.5\r\n")
+    table, arena = r.gets()
+    assert [(o, l, chr(t)) for o, l, t in _slices(table)] == [
+        (0, 3, "*"),
+        (5, 1, "#"),
+        (8, -1, "_"),
+        (12, 3, ","),
+    ]
 
 
 def test_error_reply_is_a_typed_slice():
