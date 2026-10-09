@@ -98,6 +98,17 @@ struct ResponseSlice(Movable, ImplicitlyCopyable, Writable):
         t"ResponseSlice({self.offset}, {self.length}, {self.resp_type})".write_to(writer)
 
 
+struct ScanFrame(ImplicitlyCopyable):
+    """One open container in a resumable scan: where its next child starts
+    and how many children are still pending."""
+    var pos: Int
+    var remaining: Int
+
+    def __init__(out self, pos: Int, remaining: Int):
+        self.pos = pos
+        self.remaining = remaining
+
+
 struct Node(Movable):
     var status: UInt8
     var pos: Int
@@ -160,11 +171,10 @@ struct Reader(Defaultable, Movable, Writable):
     var none_obj: Int
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
-    # ponytail: resume between top-level collection children; an incomplete
-    # nested child is rescanned until complete, add a scan stack if measured.
-    var scan_active: Bool
-    var scan_pos: Int
-    var scan_remaining: Int
+    # one frame per open container of the reply being scanned (hiredis'
+    # read stack, without the partially built objects), so a chunk resumes
+    # at the innermost pending element instead of rescanning it
+    var scan_frames: List[ScanFrame]
     # arena as a Python bytearray: views over it keep it alive, and CPython
     # refuses to resize an exported buffer (see _ensure_cap)
     var buf_obj: Int
@@ -188,9 +198,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.hw_incomplete_tuple = 0
         self.none_obj = 0
         self.needs_scan = False
-        self.scan_active = False
-        self.scan_pos = 0
-        self.scan_remaining = 0
+        self.scan_frames = List[ScanFrame]()
         self.buf_obj = 0
         self.highway_slices = List[ResponseSlice]()
 
@@ -527,9 +535,7 @@ struct Reader(Defaultable, Movable, Writable):
             self_ptr[].buf_len = 0
             self_ptr[].consumed = 0
         self_ptr[].needs_scan = False
-        self_ptr[].scan_active = False
-        self_ptr[].scan_pos = 0
-        self_ptr[].scan_remaining = 0
+        self_ptr[].scan_frames.clear()
         return PythonObject(0)
 
     @staticmethod
@@ -847,9 +853,7 @@ def _arena_detach(mut r: Reader, want_cap: Int) raises:
     r.buf_cap = cap
     r.buf_len = pending
     r.consumed = 0
-    r.scan_active = False
-    r.scan_pos = 0
-    r.scan_remaining = 0
+    r.scan_frames.clear()
     r.buf_addr = Int(_arena_ptr(r.buf_obj))
 
 
@@ -885,9 +889,7 @@ def _compact(mut r: Reader):
     if r.consumed == r.buf_len:
         r.buf_len = 0
         r.consumed = 0
-        r.scan_active = False
-        r.scan_pos = 0
-        r.scan_remaining = 0
+        r.scan_frames.clear()
         # released an oversized arena instead of pinning it for the life of
         # the reader (hiredis trims an empty buffer's free space above maxbuf)
         if r.maxbuf > 0 and r.buf_cap > r.maxbuf and not _arena_pinned(r):
@@ -904,8 +906,9 @@ def _compact(mut r: Reader):
         var src = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr + r.consumed)
         _ = external_call["memmove", Pointer[UInt8, MutAnyOrigin]](
             dst, src, c_size_t(r.buf_len - r.consumed))
-        if r.scan_active:
-            r.scan_pos -= r.consumed
+        var nframes = len(r.scan_frames)
+        for i in range(nframes):
+            r.scan_frames[i].pos -= r.consumed
         r.buf_len -= r.consumed
         r.consumed = 0
 
@@ -1656,52 +1659,127 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
     return _scan_resp[False](ptr, start, end, none_slices, 0, depth)
 
 
-def _scan_resume(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
-    """Resumable completeness scan for a top-level collection.
+struct ScanHeader(ImplicitlyCopyable):
+    """Result of parsing one collection header: status, payload start, and the
+    normalized child count (-1 = nil container)."""
+    var status: UInt8
+    var after: Int
+    var children: Int
 
-    Progress commits at child boundaries, so a chunked feed rescans only the
-    one child spanning the chunk boundary instead of the whole reply; without
-    this the chunked rewrite is O(n^2) in the reply size (measured: 4 KiB
-    chunks over a 20k-element array were 50x slower than hiredis).
+    def __init__(out self, status: UInt8, after: Int, children: Int):
+        self.status = status
+        self.after = after
+        self.children = children
+
+
+def _scan_header(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int) -> ScanHeader:
+    """Header of a stack-scanned collection ('*', '>', '~', '%').
+
+    Mirrors the validation in _scan_resp, including the min-bytes heuristic
+    and the pair-to-child normalization for maps.  Only ST_INCOMPLETE matters
+    to the caller's control flow; protocol errors are re-reported with their
+    exact text by the build that follows a complete scan.
     """
-    if r.scan_active and r.scan_pos < r.consumed:
-        r.scan_active = False
-    if not r.scan_active:
-        var after_int = r.consumed + 1
-        var status: UInt8 = ST_OK
-        var count = _read_int(ptr, r.consumed + 1, r.buf_len, after_int, status)
-        if status == ST_INCOMPLETE:
+    var t = ptr.unsafe_offset(start)[]
+    var after_int = start + 1
+    var status: UInt8 = ST_OK
+    var count = _read_int(ptr, start + 1, end, after_int, status)
+    if status == ST_INCOMPLETE:
+        return ScanHeader(ST_INCOMPLETE, after_int, 0)
+    if status == ST_PROTO_ERR:
+        return ScanHeader(ST_PROTO_ERR, after_int, 0)
+    var children = count
+    if t == TYPE_MAP:
+        if count < 0:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        children = count * 2
+        if count > MAX_CONTAINER_ELEMENTS:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if depth > MAX_DEPTH:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if count > (end - after_int) // 6:
+            return ScanHeader(ST_INCOMPLETE, after_int, 0)
+    elif t == TYPE_SET:
+        if count < 0:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if count > MAX_CONTAINER_ELEMENTS:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if depth > MAX_DEPTH:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if count > (end - after_int) // 3:
+            return ScanHeader(ST_INCOMPLETE, after_int, 0)
+    else:  # '*' / '>'
+        if count < -1:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if count > MAX_CONTAINER_ELEMENTS:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if depth > MAX_DEPTH:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if count > (end - after_int) // 3:
+            return ScanHeader(ST_INCOMPLETE, after_int, 0)
+    return ScanHeader(ST_OK, after_int, children)
+
+
+def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
+    """Resumable completeness scan with one frame per open container.
+
+    The flat scanner remembered only the next child at one level, so a nested
+    container spanning a chunk was walked from its start on every feed
+    (quadratic in its size).  Frames keep each open container's position, so
+    the next chunk resumes at the innermost pending element: hiredis' read
+    stack, minus the partially built reply objects.
+    """
+    if len(r.scan_frames) == 0:
+        var h0 = _scan_header(ptr, r.consumed, r.buf_len, 1)
+        if h0.status == ST_INCOMPLETE:
             return ST_INCOMPLETE
-        if status == ST_PROTO_ERR:
+        if h0.status == ST_PROTO_ERR:
             return ST_PROTO_ERR
-        var children = count
-        var t = ptr.unsafe_offset(r.consumed)[]
-        if t == TYPE_MAP:
-            # '%' counts key/value pairs: scan both as independent children
-            if count < 0 or count > MAX_CONTAINER_ELEMENTS:
-                return ST_PROTO_ERR
-            children = count * 2
-        elif t == TYPE_SET:
-            if count < 0 or count > MAX_CONTAINER_ELEMENTS:
-                return ST_PROTO_ERR
-        elif count < -1:
-            return ST_PROTO_ERR
-        elif count == -1:
-            return ST_OK  # nil array/push
-        r.scan_pos = after_int
-        r.scan_remaining = children
-        r.scan_active = True
+        if h0.children == -1 or h0.children == 0:
+            return ST_OK  # nil or empty container
+        r.scan_frames.append(ScanFrame(h0.after, h0.children))
     var none_slices = List[ResponseSlice]()
-    while r.scan_remaining > 0:
-        var child = _scan_resp[False](ptr, r.scan_pos, r.buf_len, none_slices, 0, 2)
+    while len(r.scan_frames) > 0:
+        var f = r.scan_frames.pop()
+        if f.remaining == 0:
+            # this container is complete: settle it into its parent
+            if len(r.scan_frames) == 0:
+                return ST_OK
+            var parent = r.scan_frames.pop()
+            parent.pos = f.pos
+            parent.remaining -= 1
+            r.scan_frames.append(parent)
+            continue
+        var t = ptr.unsafe_offset(f.pos)[]
+        var child_depth = len(r.scan_frames) + 2
+        if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP:
+            var h = _scan_header(ptr, f.pos, r.buf_len, child_depth)
+            if h.status == ST_INCOMPLETE:
+                r.scan_frames.append(f)
+                return ST_INCOMPLETE
+            if h.status == ST_PROTO_ERR:
+                r.scan_frames.clear()
+                return ST_PROTO_ERR
+            if h.children == -1 or h.children == 0:
+                f.pos = h.after
+                f.remaining -= 1
+                r.scan_frames.append(f)
+                continue
+            r.scan_frames.append(f)
+            r.scan_frames.append(ScanFrame(h.after, h.children))
+            continue
+        # leaves (and '|' attributes, which the stack does not open) go through
+        # the recursive scanner, which allocates nothing
+        var child = _scan_resp[False](ptr, f.pos, r.buf_len, none_slices, 0, child_depth)
         if child.status == ST_PROTO_ERR:
-            r.scan_active = False
+            r.scan_frames.clear()
             return ST_PROTO_ERR
         if child.status == ST_INCOMPLETE:
+            r.scan_frames.append(f)
             return ST_INCOMPLETE
-        r.scan_pos = child.pos
-        r.scan_remaining -= 1
-    r.scan_active = False
+        f.pos = child.pos
+        f.remaining -= 1
+        r.scan_frames.append(f)
     return ST_OK
 
 
@@ -1710,14 +1788,12 @@ def _scan_needs(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     var t = ptr.unsafe_offset(r.consumed)[]
     var status: UInt8 = ST_OK
     if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP:
-        status = _scan_resume(r, ptr)
+        status = _scan_stack(r, ptr)
     else:
         var sc = _scan_node(ptr, r.consumed, r.buf_len, 1)
         status = sc.status
     if status != ST_INCOMPLETE:
-        r.scan_active = False
-        r.scan_pos = 0
-        r.scan_remaining = 0
+        r.scan_frames.clear()
     return status
 
 

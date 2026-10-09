@@ -303,6 +303,81 @@ def test_chunked_large_map_and_set_match_single_feed():
             assert repr(_drain_chunked(payload, chunk)) == repr(want)
 
 
+def _chunked_outcome(payload, chunk):
+    """Replies (or the first exception) from feeding in chunks and draining."""
+    r = hpredis.Reader()
+    out = []
+    try:
+        for off in range(0, len(payload), chunk):
+            r.feed(payload[off : off + chunk])
+            out.extend(r.drain(False))
+        return ("ok", out)
+    except Exception as exc:  # noqa: BLE001
+        return (type(exc).__name__, str(exc))
+
+
+def _norm(v):
+    if type(v).__name__ == "PushNotification":
+        return ("PUSH", _norm(list(v)))
+    if isinstance(v, list):
+        return [_norm(x) for x in v]
+    if isinstance(v, dict):
+        return sorted((_norm(k), _norm(x)) for k, x in v.items())
+    if isinstance(v, set):
+        return sorted(_norm(x) for x in v)
+    return v
+
+
+def test_chunked_deep_nesting_matches_single_feed():
+    payload = (
+        b"*2\r\n"
+        b"*3\r\n"
+        b"%2\r\n$1\r\nk\r\n*2\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nv\r\n:1\r\n"
+        b"~2\r\n$1\r\nx\r\n$1\r\nr\r\n"
+        b"+done\r\n"
+        b">1\r\n$1\r\np\r\n"
+    )
+    one = hpredis.Reader()
+    one.feed(payload)
+    want = [_norm(x) for x in one.drain(False)]
+    for chunk in (1, 3, 7, 777):
+        outcome = _chunked_outcome(payload, chunk)
+        assert outcome[0] == "ok", (chunk, outcome)
+        assert [_norm(x) for x in outcome[1]] == want, chunk
+
+
+def test_chunked_max_depth_matches_single_feed():
+    for payload in (b"*1\r\n" * 1024 + b":1\r\n", b"*1\r\n" * 1025 + b":1\r\n"):
+        one = hpredis.Reader()
+        one.feed(payload)
+        try:
+            want = ("ok", one.drain(False))
+        except Exception as exc:  # noqa: BLE001
+            want = (type(exc).__name__, str(exc))
+        for chunk in (1, 7, 4096):
+            outcome = _chunked_outcome(payload, chunk)
+            if want[0] == "ok":
+                assert outcome[0] == "ok", (chunk, outcome)
+                depth, leaf = 0, outcome[1][0]
+                while isinstance(leaf, list) and len(leaf) == 1:
+                    leaf, depth = leaf[0], depth + 1
+                assert (depth, leaf) == (1024, 1), chunk
+            else:
+                assert outcome == want, (chunk, outcome, want)
+
+
+def test_chunked_nested_protocol_error_matches_single_feed():
+    payload = b"*2\r\n*2\r\n$1\r\na\r\n?bad\r\n+tail\r\n"
+    one = hpredis.Reader()
+    one.feed(payload)
+    try:
+        want = ("ok", one.drain(False))
+    except Exception as exc:  # noqa: BLE001
+        want = (type(exc).__name__, str(exc))
+    for chunk in (1, 5, 4096):
+        assert _chunked_outcome(payload, chunk) == want, chunk
+
+
 def test_chunked_protocol_error_is_reported_once_complete():
     # the error sits past the first chunk boundary: both the scan and the
     # builder must agree that the reply is complete before reporting it

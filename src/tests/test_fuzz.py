@@ -114,7 +114,7 @@ def test_fuzz_fragmented_seeded():
 
     rng = random.Random(777)
     for i in range(150):
-        payload, _ = rand_resp(rng, max_depth=3)
+        payload, _ = rand_resp(rng, max_depth=4)
         hr, mine = hiredis.Reader(), hpredis.Reader()
         pos = 0
         while pos < len(payload):
