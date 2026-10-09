@@ -160,6 +160,11 @@ class Reader:
             elif prefetched[0] == 1:
                 self._exhausted = True
                 return self._notEnoughData
+            elif prefetched[0] == 10:
+                # lone reply that drained the buffer: the poll before the next
+                # socket read answers here instead of crossing into the core
+                self._exhausted = True
+                return prefetched[1]
             else:
                 self._special = True
         if self._pending_index < self._pending_count:

@@ -53,6 +53,9 @@ comptime ST_DECODE_ERR = 7
 # private prefetch outcomes
 comptime ST_PREFETCH_SPECIAL = 8
 comptime ST_PREFETCH_BATCH = 9
+# lone reply that emptied the buffer: wrapper latches _exhausted for the
+# poll redis-py runs before its next socket read
+comptime ST_PREFETCH_DRAINED = 10
 
 # ponytail: cap batches between replies at 64 KiB / 4096 items; one oversized
 # scalar is unavoidable. Raise the cap only if profiling justifies it.
@@ -400,8 +403,11 @@ struct Reader(Defaultable, Movable, Writable):
                 wire_len = crlf + 2 - pos
                 self_ptr[].consumed = crlf + 2
             else:
-                # Containers and pushes have wrapper-specific finalization.
-                if t == TYPE_ARRAY or t == 62 or t == 37 or t == 126:
+                # Top-level pushes carry the wrapper's PushNotification type;
+                # arrays/maps/sets parse here, because a clean one is exactly
+                # the object try_gets would return.  Marker cases (nested
+                # error/push) fall through to try_gets via the had_err check.
+                if t == 62:
                     special = True
                     break
                 var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
@@ -432,6 +438,8 @@ struct Reader(Defaultable, Movable, Writable):
                 return _status_tuple(ST_PREFETCH_SPECIAL, _none_payload())
             return Reader._incomplete_result(self_ptr)
         if reply_count == 1:
+            if self_ptr[].consumed >= self_ptr[].buf_len:
+                return _prefetch_drained_result(first_payload)
             return PythonObject(from_owned=first_payload)
         return _prefetch_batch_result(_list_of(collected), _list_of(lengths))
 
@@ -932,6 +940,14 @@ def _prefetch_batch_result(replies: PyObjectPtr, lengths: PyObjectPtr) raises ->
     _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(ST_PREFETCH_BATCH))
     _ = cpy.PyTuple_SetItem(t, 1, replies)
     _ = cpy.PyTuple_SetItem(t, 2, lengths)
+    return PythonObject(from_owned=t)
+
+
+def _prefetch_drained_result(payload: PyObjectPtr) raises -> PythonObject:
+    ref cpy = Python().cpython()
+    var t = cpy.PyTuple_New(2)
+    _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(ST_PREFETCH_DRAINED))
+    _ = cpy.PyTuple_SetItem(t, 1, payload)
     return PythonObject(from_owned=t)
 
 
