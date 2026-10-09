@@ -435,6 +435,62 @@ def test_huge_length_header_does_not_crash(payload):
 @pytest.mark.parametrize(
     "payload",
     [
+        b"$9223372036854775808\r\n",   # Int64.max + 1
+        b"$18446744073709551614\r\n",  # UInt64.max - 1
+        b"$18446744073709551615\r\n",  # UInt64.max: used to wrap to nil
+        b"$18446744073709551616\r\n",  # UInt64 overflow
+        b"=18446744073709551615\r\n",  # the same cap on verbatim lengths
+    ],
+)
+def test_over_int64_lengths_match_hiredis(payload):
+    # _read_len_fast used to return Int(value) for any UInt64, so UInt64.max
+    # wrapped to -1 and $18446744073709551615 came back as a nil reply;
+    # hiredis rejects every length above Int64.max as "Bad bulk string length"
+    outcomes = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.feed(payload)
+        try:
+            outcomes.append(("ok", repr(r.gets(False))))
+        except Exception as exc:
+            outcomes.append((type(exc).__name__, str(exc)))
+    assert outcomes[0] == outcomes[1]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"=-1\r\n",
+        b"=-2\r\n",
+        b"=-9223372036854775808\r\n",
+        b"=0\r\n\r\n",
+        b"=3\r\nabc\r\n",
+        b"=4\r\nabcd\r\n",
+        b"=4\r\na:bc\r\n",
+        b"=5\r\nabc:d\r\n",
+        b"=5\r\nab:cd\r\n",
+        b"=6\r\nTXT:xy\r\n",
+        b"=8\r\ntxt:abcd\r\n",
+    ],
+)
+def test_verbatim_length_and_format_match_hiredis(payload):
+    # a verbatim payload needs a 4-byte "xxx:" specifier; -1 is nil, below -1
+    # is a bulk range error. The old code searched for any colon and read past
+    # the reply when there was none.
+    outcomes = []
+    for mod in (hiredis, hpredis):
+        r = mod.Reader()
+        r.feed(payload)
+        try:
+            outcomes.append(("ok", repr(r.gets(False))))
+        except Exception as exc:
+            outcomes.append((type(exc).__name__, str(exc)))
+    assert outcomes[0] == outcomes[1]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
         b",abc\r\n",
         b",\r\n",
         b",1 \r\n",

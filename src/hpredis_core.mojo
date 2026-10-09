@@ -31,7 +31,8 @@ comptime ERR_BAD_DOUBLE = 7
 comptime ERR_DOUBLE_LARGE = 8
 comptime ERR_BAD_BOOL = 9
 comptime ERR_BAD_NULL = 10
-comptime ERR_BAD_VERBATIM = 11
+# '=' payloads must start with a 4-byte format specifier ("txt:", "mkd:", ...)
+comptime ERR_VERBATIM_FORMAT = 11
 comptime ERR_BAD_SET = 12
 comptime ERR_BAD_MAP = 13
 comptime ERR_BAD_ATTR = 14
@@ -1143,6 +1144,31 @@ def _double_chars_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -
     return True
 
 
+def _double_parse(
+    ptr: Pointer[UInt8, MutAnyOrigin], pstart: Int, crlf: Int, mut out_val: Float64
+) -> UInt8:
+    """Validate a ',' double like the build path; ERR_NONE or an ERR_* code.
+
+    Shared with the highway scan so both modes reject the same inputs (the
+    scan used to skip strtod and accepted ",1e9999").
+    """
+    if crlf - pstart >= 326:  # hiredis char buf[326]
+        return ERR_DOUBLE_LARGE
+    if not _double_chars_ok(ptr, pstart, crlf):
+        return ERR_BAD_DOUBLE
+    # borrow the CRLF byte as strtod's NUL terminator, then restore it
+    ptr.unsafe_offset(crlf)[] = 0
+    var errno_ptr = external_call["__errno_location", Pointer[c_int, MutAnyOrigin]]()
+    errno_ptr[] = 0
+    var endp = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(ptr) + crlf)
+    out_val = external_call["strtod", Float64](ptr.unsafe_offset(pstart), Pointer(to=endp))
+    var err = errno_ptr[]  # ERANGE == 34: overflow and underflow both fail
+    ptr.unsafe_offset(crlf)[] = 13
+    if Int(endp) != Int(ptr) + crlf or err == 34:
+        return ERR_BAD_DOUBLE
+    return ERR_NONE
+
+
 def _bignum_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
     """hiredis accepts an optional '-' followed by at least one digit."""
     var i = start
@@ -1218,6 +1244,11 @@ def _read_len_fast(
                 if value > 18446744073709551615 - UInt64(d - 48):
                     break
                 value += UInt64(d - 48)
+                if value > 9223372036854775807:
+                    # fall back to the strict parser, which caps at Int64 and
+                    # reports "Bad bulk string length"; without this Int(value)
+                    # wraps (UInt64.max becomes -1, i.e. a nil bulk reply)
+                    break
                 i += 1
     return _read_int(ptr, start, end, out_end, status)
 
@@ -1340,20 +1371,22 @@ def _scan_resp[HIGHWAY: Bool](
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return ScanResult(ST_INCOMPLETE, start)
+        # validate the same way the build path does: the highway scan is the
+        # only pass a highway reply gets, so it must reject bad ints/doubles
+        if t == TYPE_INT:
+            var after_crlf = crlf
+            var status: UInt8 = ST_OK
+            _ = _parse_int_line(ptr, start + 1, crlf, after_crlf, status)
+            if status == ST_PROTO_ERR:
+                return ScanResult(ST_PROTO_ERR, start, ERR_BAD_INT, 0)
+        elif t == 44:
+            var dval: Float64 = 0.0
+            var derr = _double_parse(ptr, start + 1, crlf, dval)
+            if derr != ERR_NONE:
+                return ScanResult(ST_PROTO_ERR, start, derr, 0)
         if HIGHWAY:
             _record_slice(slices, start + 1 - base, crlf - (start + 1), t)
-            return ScanResult(ST_OK, crlf + 2)
-        else:
-            if t == TYPE_INT:
-                var after_crlf = crlf
-                var status: UInt8 = ST_OK
-                _ = _parse_int_line(ptr, start + 1, crlf, after_crlf, status)
-                if status == ST_INCOMPLETE:
-                    return ScanResult(ST_INCOMPLETE, start)
-                if status == ST_PROTO_ERR:
-                    return ScanResult(ST_PROTO_ERR, start)
-                return ScanResult(ST_OK, after_crlf)
-            return ScanResult(ST_OK, crlf + 2)
+        return ScanResult(ST_OK, crlf + 2)
     if t == TYPE_BULK:
         var after_int = start + 1
         var status: UInt8 = ST_OK
@@ -1480,19 +1513,23 @@ def _scan_resp[HIGHWAY: Bool](
         var vlen = _read_int(ptr, start + 1, end, after_int4, status4)
         if status4 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
-        if status4 == ST_PROTO_ERR or vlen < 0:
-            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_VERBATIM, 0)
+        if status4 == ST_PROTO_ERR:
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BULK_LEN, 0)
+        if vlen < -1:
+            return ScanResult(ST_PROTO_ERR, start, ERR_BULK_RANGE, 0)
+        if vlen == -1:
+            if HIGHWAY:
+                _record_slice(slices, start - base, -1, t)  # nil row
+            return ScanResult(ST_OK, after_int4)
         var pstart4 = after_int4
         if vlen > end - pstart4 - 2:
             return ScanResult(ST_INCOMPLETE, start)
+        if vlen < 4:
+            return ScanResult(ST_PROTO_ERR, start, ERR_VERBATIM_FORMAT, 0)
+        if ptr.unsafe_offset(pstart4 + 3)[] != 58:  # ':'
+            return ScanResult(ST_PROTO_ERR, start, ERR_VERBATIM_FORMAT, 0)
         if HIGHWAY:
-            var colon = _find_byte(ptr, pstart4, pstart4 + vlen, 58)
-            var vpos = pstart4 + vlen
-            var vlen2 = vlen
-            if colon >= 0:
-                vpos = colon + 1
-                vlen2 = pstart4 + vlen - vpos
-            _record_slice(slices, vpos - base, vlen2, t)
+            _record_slice(slices, pstart4 + 4 - base, vlen - 4, t)
         return ScanResult(ST_OK, pstart4 + vlen + 2)
     if t == 35:  # '#' bool
         if start + 2 > end:
@@ -1760,21 +1797,10 @@ def _parse_node(
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return _incomplete_node(start)
-        var pstart = start + 1
-        if crlf - pstart >= 326:  # hiredis char buf[326]
-            return _proto_node(start, ERR_DOUBLE_LARGE)
-        if not _double_chars_ok(ptr, pstart, crlf):
-            return _proto_node(start, ERR_BAD_DOUBLE)
-        # borrow the CRLF byte as strtod's NUL terminator, then restore it
-        ptr.unsafe_offset(crlf)[] = 0
-        var errno_ptr = external_call["__errno_location", Pointer[c_int, MutAnyOrigin]]()
-        errno_ptr[] = 0
-        var endp = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(ptr) + crlf)
-        var dval = external_call["strtod", Float64](ptr.unsafe_offset(pstart), Pointer(to=endp))
-        var err = errno_ptr[]  # ERANGE == 34: overflow and underflow both fail
-        ptr.unsafe_offset(crlf)[] = 13
-        if Int(endp) != Int(ptr) + crlf or err == 34:
-            return _proto_node(start, ERR_BAD_DOUBLE)
+        var dval: Float64 = 0.0
+        var derr = _double_parse(ptr, start + 1, crlf, dval)
+        if derr != ERR_NONE:
+            return _proto_node(start, derr)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(dval)))
     if t == 35:  # '#' bool: #t\r\n / #f\r\n
         if start + 2 > end:
@@ -1802,18 +1828,24 @@ def _parse_node(
         var vlen = _read_int(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return _incomplete_node(start)
-        if status == ST_PROTO_ERR or vlen < 0:
-            return _proto_node(start, ERR_BAD_VERBATIM)
+        if status == ST_PROTO_ERR:
+            # hiredis reports every length-parse failure as a bulk length
+            # error, even on '=' replies (verified 3.4.2)
+            return _proto_node(start, ERR_BAD_BULK_LEN)
+        if vlen < -1:
+            return _proto_node(start, ERR_BULK_RANGE)
+        if vlen == -1:
+            return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
         var pstart = after_int
         if vlen > end - pstart - 2:
             return _incomplete_node(start)
-        var colon = _find_byte(ptr, pstart, pstart + vlen, 58)
-        var vpos = pstart + vlen
-        var vlen2 = vlen
-        if colon >= 0:
-            vpos = colon + 1
-            vlen2 = pstart + vlen - vpos
-        return Node(ST_OK, pstart + vlen + 2, PythonObject(from_owned=_leaf_payload(ptr, vpos, vlen2, cnv)))
+        # hiredis requires the 4-byte format specifier before the colon; the
+        # value is what follows it (verified 3.4.2)
+        if vlen < 4:
+            return _proto_node(start, ERR_VERBATIM_FORMAT)
+        if ptr.unsafe_offset(pstart + 3)[] != 58:  # ':'
+            return _proto_node(start, ERR_VERBATIM_FORMAT)
+        return Node(ST_OK, pstart + vlen + 2, PythonObject(from_owned=_leaf_payload(ptr, pstart + 4, vlen - 4, cnv)))
     if t == 126:  # '~' set -> plain list (hiredis-py parity)
         var after_int2 = start + 1
         var status2: UInt8 = ST_OK
@@ -1922,15 +1954,6 @@ def _parse_node(
     return _proto_node_byte(start, ERR_UNKNOWN_TYPE, t)
 
 
-def _find_byte(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, byte: UInt8) -> Int:
-    var hit = external_call["memchr", Pointer[UInt8, MutAnyOrigin]](
-        ptr.unsafe_offset(start), c_int(Int(byte)), c_size_t(end - start))
-    if Int(hit) == 0:
-        return -1
-    return Int(hit) - Int(ptr)
-
-
-
 def _err_text(err_code: UInt8, err_byte: UInt8) -> String:
     """Map a protocol-error code to hiredis' exact message text."""
     if err_code == ERR_BAD_INT:
@@ -1953,8 +1976,8 @@ def _err_text(err_code: UInt8, err_byte: UInt8) -> String:
         return String("Bad bool value")
     if err_code == ERR_BAD_NULL:
         return String("Protocol error: invalid null reply")
-    if err_code == ERR_BAD_VERBATIM:
-        return String("Bad verbatim string length")
+    if err_code == ERR_VERBATIM_FORMAT:
+        return String("Verbatim string 4 bytes of content type are missing or incorrectly encoded.")
     if err_code == ERR_BAD_SET:
         return String("Bad set length")
     if err_code == ERR_BAD_MAP:

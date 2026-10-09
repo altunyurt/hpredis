@@ -150,6 +150,48 @@ def test_real_statuses():
         r.gets()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b":abc\r\n",
+        b":1a\r\n",
+        b":01\r\n",
+        b",abc\r\n",
+        b",+1\r\n",
+        b",1e9999\r\n",
+        b",1e-9999\r\n",
+        b",0x10\r\n",
+        b",1_0\r\n",
+    ],
+)
+def test_highway_rejects_malformed_int_and_double(payload):
+    # the highway scan used to skip the int/double validation the build path
+    # applies, so it accepted replies that classic mode and hiredis reject
+    r = hpredis.Reader(highway_mode=True)
+    r.feed(payload)
+    with pytest.raises(hpredis.ProtocolError):
+        r.gets()
+
+
+def test_highway_verbatim_slice_nil_and_format_error():
+    r = hpredis.Reader(highway_mode=True)
+    r.feed(b"=8\r\ntxt:abcd\r\n")
+    table, arena = r.gets()
+    off, length, typ = _slices(table)[0]
+    assert (length, chr(typ)) == (4, "=")
+    assert bytes(arena[off : off + length]) == b"abcd"
+
+    r = hpredis.Reader(highway_mode=True)
+    r.feed(b"=-1\r\n")
+    table, arena = r.gets()
+    assert _slices(table) == [(0, -1, 61)]
+
+    r = hpredis.Reader(highway_mode=True)
+    r.feed(b"=3\r\nabc\r\n")
+    with pytest.raises(hpredis.ProtocolError, match="content type"):
+        r.gets()
+
+
 def test_highway_nil_and_container_rows_align():
     # a missing MGET element is a -1 row, so later rows cannot shift up
     r = hpredis.Reader(highway_mode=True)
