@@ -184,8 +184,6 @@ class Reader:
         return self._handle_gets_result(result, should_decode)
 
     def _handle_gets_result(self, result, should_decode):
-        if type(result) is not tuple:
-            return result
         status, payload = result
         if status == 1:
             self._exhausted = True
