@@ -653,7 +653,8 @@ def test_exports_and_error_hierarchy_match_hiredis():
     assert issubclass(hpredis.ProtocolError, hpredis.HiredisError)
     assert issubclass(hpredis.ReplyError, hpredis.HiredisError)
     assert not hasattr(hpredis.Reader, "__len__")  # hiredis has no __len__
-    assert hpredis.__version__
+    major, minor = (int(p) for p in hpredis.__version__.split(".")[:2])
+    assert major > 3 or (major == 3 and minor >= 2)  # redis-py's HIREDIS gate
     assert "Reader" in hpredis.__all__
 
 

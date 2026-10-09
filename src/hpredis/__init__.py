@@ -24,7 +24,10 @@ __all__ = [
     "Reader",
     "pack_command",
 ]
-__version__ = "0.1.0"
+# The hiredis-py API version this module emulates.  redis-py gates on this
+# value (redis/utils.py requires >= 3.2), so it describes the emulated API,
+# not this package's own release number.
+__version__ = "3.4.2"
 
 
 class HiredisError(Exception):

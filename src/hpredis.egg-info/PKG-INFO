@@ -8,84 +8,147 @@ Description-Content-Type: text/markdown
 License-File: LICENSE
 Dynamic: license-file
 
-# hpredis — a Mojo drop-in replacement for hiredis-py
+# hpredis
 
-A Mojo-based RESP parser with a hiredis-py-compatible `Reader` API, plus an
-optional zero-copy **Highway Mode** for AI/ML vector workloads.
+A RESP protocol reader for Python, written in Mojo.
+
+`hpredis.Reader` implements the same interface as `hiredis.Reader`, so
+existing hiredis-py code can switch by changing the import. The reader also
+has a highway mode that returns raw byte offsets into its receive buffer,
+which NumPy and native code can read without copying.
+
+## Aim
+
+The project aims to be a RESP reader that existing hiredis-py and redis-py
+users can adopt without rewriting code: the same constructor, reply types,
+error text, and edge cases. On top of that, highway mode hands large payloads
+to native consumers as byte offsets, so a vector can be read by NumPy or an
+extension without building a Python object per payload. The remaining work is
+listed in the Status section.
 
 ```python
-import hpredis
 import numpy as np
+import hpredis
 
-# classic: drop-in for hiredis.Reader (feed/gets, redis-py compatible)
+# Classic mode: the hiredis.Reader interface.
 r = hpredis.Reader()
 r.feed(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
 assert r.gets() == [b"hello", b"world"]
 
-# highway: one call gives an offsets table plus the buffer it points into
+# Highway mode: one call returns an offsets table plus the buffer.
+vec = np.arange(1536, dtype=np.float32).tobytes()
 h = hpredis.Reader(highway_mode=True)
-vector_bytes = bytes(6144)  # replace with a packed vector
-h.feed(b"$6144\r\n" + vector_bytes + b"\r\n")
-table, arena = h.gets()                     # n*24 bytes: (offset, length, type)
-# read the whole table in one call (don't struct.unpack per slice)
+h.feed(b"$%d\r\n" % len(vec) + vec + b"\r\n")
+table, arena = h.gets()
 triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
 off, length, resp_type = triples[0]
 arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 ```
 
-## Features
+## Feature comparison
 
-- `Reader(protocolError, replyError, encoding, errors, notEnoughData,
-  highway_mode)` — hiredis-py 3.4.2 Reader compatibility, checked against the
-  upstream Reader tests
-- redis-py 8.1 integration tested end-to-end (ping/get/set/hset/incr/lrange/
-  pipelines, `decode_responses`, `CLIENT SETINFO`, fragmented recv)
-- Highway mode: one call returns an offsets table plus the `bytearray` it
-  points into, so NumPy/PyTorch/JAX read payloads without a copy and without a
-  per-slice call; views own their bytes (valid across later feeds)
+| | hiredis-py 3.4.2 | hpredis |
+|---|---|---|
+| `Reader` API (`feed`, `gets`, `len`, `has_data`, `set_encoding`, `setmaxbuf`, `getmaxbuf`, `close`) | yes | yes |
+| `pack_command`, `HiredisError`, `ProtocolError`, `ReplyError`, `PushNotification` | yes | yes |
+| RESP2, and the RESP3 types redis-py uses (maps, sets, pushes, doubles, booleans, nulls, big numbers, verbatim strings, attributes) | yes | yes |
+| Error text, length caps, and nesting depth | reference | matching, checked by the tests and a differential fuzzer |
+| Batched parse through `drain()` | no | yes, with an optional `max_replies` cap |
+| Zero-copy payload reads through highway mode | no | yes, byte offsets into the receive buffer |
+| redis-py 8.1 (sync client, pipelines, `decode_responses`) | yes | yes, tested through fakeredis |
+| Runtime dependencies | none | none |
+| Implementation | C extension, vendored hiredis | Mojo extension |
+| Python versions | 3.9 to 3.15, PyPy | 3.12 and newer |
+| Platforms | Linux, macOS, Windows, FreeBSD | Linux wheel; source build needs the Mojo toolchain |
+
+## Using it as a drop-in
+
+Programs that import hiredis-py can switch by changing the import:
+
+```python
+import hpredis as hiredis
+```
+
+For redis-py, route the reader before the first connection is created:
+
+```python
+import sys
+import hpredis
+
+sys.modules["hiredis"] = hpredis
+import redis
+```
+
+If redis-py is already imported, replace the attributes it reads:
+
+```python
+import hiredis
+import hpredis
+
+hiredis.Reader = hpredis.Reader
+hiredis.PushNotification = hpredis.PushNotification
+```
+
+`hpredis.Reader` accepts the constructor arguments redis-py passes,
+including `protocolError`, `replyError`, `encoding`, `errors`, and
+`notEnoughData`. `hpredis.__version__` reports the hiredis-py release whose
+behavior it matches (3.4.2), which is the value redis-py checks before it
+enables its hiredis parser.
+
+## Highway mode
+
+`Reader(highway_mode=True)` returns `(table, arena)` from `gets()`. The table
+holds 24-byte rows of little-endian int64 values `(offset, length, resp_type)`
+with offsets into the arena, a `bytearray` that holds the reply. A view of
+the arena keeps it alive, so payloads stay valid after the reader is
+collected or new data is fed. The rows cover every item in the reply in wire
+order: byte payloads carry a slice, nil has `length = -1`, booleans carry
+their `t` or `f` byte, and a container has a header row whose length is its
+child count.
 
 ## Install
 
+Python 3.12 or newer. A prebuilt wheel needs no toolchain:
+
 ```bash
-pip install hpredis   # platform wheel, no toolchain required
-pip install .         # source checkout: builds the Mojo extension
+pip install hpredis-0.1.0-cp312-cp312-linux_x86_64.whl
 ```
 
-A prebuilt wheel ships `hpredis_core.so`, so installing it needs no
-toolchain. Installing from a clone compiles `src/hpredis_core.mojo` with
-`build.sh` and therefore requires `pip install mojo`.
+Installing from a source checkout requires the Mojo toolchain
+(`pip install mojo`), which `pip install .` invokes through `build.sh`:
+
+```bash
+pip install .
+```
 
 ## Development
 
 ```bash
-uv sync                      # venv: mojo, pytest, hiredis, fakeredis, numpy
-./build.sh                   # compile src/hpredis_core.mojo (MOJO=... overrides)
+uv sync
+./build.sh
 .venv/bin/python -m pytest -q
-uv build --wheel             # platform wheel with the prebuilt .so
+uv build --wheel
 ```
 
-## Benchmarking
+## Tests
 
-Measure representative reply shapes separately: single-reply `gets()`,
-buffered `drain()`, and native Highway consumers have different costs.
+The suite covers the upstream hiredis-py Reader tests, a seeded differential
+fuzzer that compares hpredis against hiredis-py, memory and robustness
+regressions (leaks, hostile length headers, nesting depth, chunked feeds),
+highway mode, and redis-py integration through fakeredis.
 
-## Architecture
+## Status
 
-```
-Python bytes ──feed──► Mojo-managed bytearray arena
-                          │  RESP scanner (memchr CRLF search)
-                          ├─► classic: CPython C-API objects (list/bytes/int)
-                          └─► highway: (offsets table, arena) for native reads
-```
+Classic mode parses RESP2 and RESP3 and matches hiredis-py on the tested
+behavior and error cases. Bulk arrays and batched reads perform close to
+hiredis-py. A single `gets()` call has more per-call overhead, which is the
+main performance item left. Planned work: Python 3.9 to 3.11 support,
+published wheels for more platforms, and lower per-call overhead.
 
 ## Limitations
 
-- Per-reply `gets()` is slower for tiny responses; `drain()` batches buffered
-  replies and is faster for pipeline workloads
-- Highway Mode exposes a pre-order table, not nested Python reply objects:
-  payload slices, `length = -1` for nil, and a header row (child count) per
-  container; it is intended for native consumers
-- `setmaxbuf()` stores the hiredis-compatible value but does not enforce it
-- Highway views keep their arena alive across feeds; the reader detaches rather
-  than overwriting bytes that are still viewed
-- Protocol-error messages match hiredis byte-for-byte, including escapes
+- `setmaxbuf()` stores the hiredis-compatible value and uses it as the idle
+  buffer trim threshold. It does not reject large replies, matching hiredis.
+- Protocol error messages match hiredis byte for byte, including escapes.
+- Highway mode returns byte offsets for native consumers; classic mode is the
+  path for Python reply objects.
