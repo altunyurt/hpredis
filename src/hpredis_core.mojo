@@ -1647,7 +1647,7 @@ def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: I
 
 
 def _scan_resume(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
-    """Resumable completeness scan for a top-level array/push reply.
+    """Resumable completeness scan for a top-level collection.
 
     Progress commits at child boundaries, so a chunked feed rescans only the
     one child spanning the chunk boundary instead of the whole reply; without
@@ -1662,12 +1662,24 @@ def _scan_resume(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
         var count = _read_int(ptr, r.consumed + 1, r.buf_len, after_int, status)
         if status == ST_INCOMPLETE:
             return ST_INCOMPLETE
-        if status == ST_PROTO_ERR or count < -1:
+        if status == ST_PROTO_ERR:
             return ST_PROTO_ERR
-        if count == -1:
-            return ST_OK
+        var children = count
+        var t = ptr.unsafe_offset(r.consumed)[]
+        if t == TYPE_MAP:
+            # '%' counts key/value pairs: scan both as independent children
+            if count < 0 or count > MAX_CONTAINER_ELEMENTS:
+                return ST_PROTO_ERR
+            children = count * 2
+        elif t == TYPE_SET:
+            if count < 0 or count > MAX_CONTAINER_ELEMENTS:
+                return ST_PROTO_ERR
+        elif count < -1:
+            return ST_PROTO_ERR
+        elif count == -1:
+            return ST_OK  # nil array/push
         r.scan_pos = after_int
-        r.scan_remaining = count
+        r.scan_remaining = children
         r.scan_active = True
     var none_slices = List[ResponseSlice]()
     while r.scan_remaining > 0:
@@ -1687,7 +1699,7 @@ def _scan_needs(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     """Scan the pending reply when a previous build came back incomplete."""
     var t = ptr.unsafe_offset(r.consumed)[]
     var status: UInt8 = ST_OK
-    if t == TYPE_ARRAY or t == TYPE_PUSH:
+    if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP:
         status = _scan_resume(r, ptr)
     else:
         var sc = _scan_node(ptr, r.consumed, r.buf_len, 1)

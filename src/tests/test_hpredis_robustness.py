@@ -292,6 +292,17 @@ def test_chunked_large_array_matches_single_feed():
         assert repr(_drain_chunked(payload, chunk)) == repr(want)
 
 
+def test_chunked_large_map_and_set_match_single_feed():
+    pairs = b"".join(b"$4\r\nk%03d\r\n:1\r\n" % i for i in range(500))
+    items = b"".join(b"$4\r\nv%03d\r\n" % i for i in range(500))
+    for payload in (b"%500\r\n" + pairs, b"~500\r\n" + items):
+        one = hpredis.Reader()
+        one.feed(payload)
+        want = one.drain(False)
+        for chunk in (1, 7, 777, 8192):
+            assert repr(_drain_chunked(payload, chunk)) == repr(want)
+
+
 def test_chunked_protocol_error_is_reported_once_complete():
     # the error sits past the first chunk boundary: both the scan and the
     # builder must agree that the reply is complete before reporting it
