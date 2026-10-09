@@ -5,7 +5,7 @@ from std.python import Python, PythonObject
 from std.python.python_object import PyObjectPtr
 from std.python.bindings import PythonModuleBuilder
 from std.os import abort
-from std.ffi import external_call, c_int, c_ssize_t, c_size_t
+from std.ffi import external_call, c_int, c_long, c_ssize_t, c_size_t
 from std.collections import List
 from std.origin import MutAnyOrigin, MutUntrackedOrigin
 from std.builtin.value import Defaultable
@@ -207,14 +207,13 @@ struct Reader(Defaultable, Movable, Writable):
     @staticmethod
     def feed(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], data: PythonObject) raises -> PythonObject:
         """Copy a buffer-protocol object (bytes/bytearray/memoryview) into the arena."""
-        ref cpy = Python().cpython()
         var raw = data.steal_data()  # steal_data detaches the ref: release it below
         var view = PyBuffer()
         var rc = external_call["PyObject_GetBuffer", c_int](
             raw, Pointer(to=view), c_int(0))  # PyBUF_SIMPLE
         if rc != 0:
-            _ = cpy.Py_DecRef(raw)
-            _ = cpy.PyErr_Clear()  # the wrapper raises TypeError
+            _decref(raw)
+            _pyerr_clear()  # the wrapper raises TypeError
             return PythonObject(1)
         var n = Int(view.len)
         if n > 0:
@@ -227,7 +226,7 @@ struct Reader(Defaultable, Movable, Writable):
                 dst, view.buf.value(), c_size_t(n))
             self_ptr[].buf_len += n
         _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
-        _ = cpy.Py_DecRef(raw)
+        _decref(raw)
         return PythonObject(0)
 
     @staticmethod
@@ -239,8 +238,8 @@ struct Reader(Defaultable, Movable, Writable):
         var enc = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](enc_obj)
         var errs = external_call["PyUnicode_AsUTF8", Pointer[UInt8, MutAnyOrigin]](errs_obj)
         # the wrapper keeps the str objects alive for the cached C strings
-        _ = Python().cpython().Py_DecRef(enc_obj)
-        _ = Python().cpython().Py_DecRef(errs_obj)
+        _decref(enc_obj)
+        _decref(errs_obj)
         self_ptr[].dec_encoding = Int(enc)
         self_ptr[].dec_errors = Int(errs)
         self_ptr[].dec_kind = UInt8(Int(py=kind))
@@ -274,9 +273,8 @@ struct Reader(Defaultable, Movable, Writable):
         Classes are stored directly (is_weak false); anything else is a
         zero-arg weakref getter, so reader/callable cycles stay collectable.
         """
-        ref cpy = Python().cpython()
         if self_ptr[].reply_error != 0:
-            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].reply_error))
+            _decref(_int_ptr(self_ptr[].reply_error))
         self_ptr[].reply_error = Int(reply_error.steal_data())
         self_ptr[].reply_error_weak = Int(py=is_weak) != 0
         return PythonObject(0)
@@ -315,7 +313,7 @@ struct Reader(Defaultable, Movable, Writable):
             var msg_len = crlf - msg_start
             var inst = _error_to_instance(
                 self_ptr[].reply_error, self_ptr[].reply_error_weak,
-                ptr.unsafe_offset(msg_start), msg_len)
+                ptr.unsafe_offset(msg_start), msg_len, self_ptr[].none_obj)
             if inst != 0:
                 self_ptr[].consumed = crlf + 2
                 self_ptr[].needs_scan = False
@@ -380,7 +378,6 @@ struct Reader(Defaultable, Movable, Writable):
         var reply_count = 0
         var batch_bytes = 0
         var special = False
-        ref cpy = Python().cpython()
         if self_ptr[].proto_err:
             return _status_tuple(ST_PREFETCH_SPECIAL, _none_payload())
         if self_ptr[].consumed >= self_ptr[].buf_len:
@@ -421,10 +418,10 @@ struct Reader(Defaultable, Movable, Writable):
                 self_ptr[].needs_scan = False
                 var inst = _error_to_instance(
                     self_ptr[].reply_error, False, ptr.unsafe_offset(pos + 1),
-                    crlf - (pos + 1))
+                    crlf - (pos + 1), self_ptr[].none_obj)
                 if inst == 0:
                     if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
-                        _ = cpy.PyErr_Clear()
+                        _pyerr_clear()
                     special = True
                     break
                 payload = PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
@@ -456,9 +453,9 @@ struct Reader(Defaultable, Movable, Writable):
             else:
                 if reply_count == 1:
                     collected.append(first_payload)
-                    lengths.append(cpy.PyLong_FromSsize_t(first_length))
+                    lengths.append(_long(first_length))
                 collected.append(payload)
-                lengths.append(cpy.PyLong_FromSsize_t(wire_len))
+                lengths.append(_long(wire_len))
             reply_count += 1
             batch_bytes += wire_len
         _compact(self_ptr[])
@@ -479,7 +476,7 @@ struct Reader(Defaultable, Movable, Writable):
             self_ptr[].incomplete_tuple = Int(
                 _status_tuple(ST_INCOMPLETE, _none_payload()).steal_data())
         var t = _int_ptr(self_ptr[].incomplete_tuple)
-        _ = Python().cpython().Py_IncRef(t)
+        _incref(t)
         return PythonObject(from_owned=t)
 
     @staticmethod
@@ -496,28 +493,27 @@ struct Reader(Defaultable, Movable, Writable):
         if self_ptr[].hw_incomplete_tuple == 0:
             self_ptr[].hw_incomplete_tuple = Int(
                 _hw_tuple(
-                    Python().cpython().PyLong_FromSsize_t(ST_INCOMPLETE),
+                    _long(Int(ST_INCOMPLETE)),
                     _none_payload(), _none_payload()).steal_data())
         var t = _int_ptr(self_ptr[].hw_incomplete_tuple)
-        _ = Python().cpython().Py_IncRef(t)
+        _incref(t)
         return PythonObject(from_owned=t)
 
     @staticmethod
     def dispose(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
         """Final release: buffers plus the cached Python references."""
         _ = Reader.free(self_ptr)
-        ref cpy = Python().cpython()
         if self_ptr[].reply_error != 0:
-            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].reply_error))
+            _decref(_int_ptr(self_ptr[].reply_error))
             self_ptr[].reply_error = 0
         if self_ptr[].incomplete_tuple != 0:
-            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].incomplete_tuple))
+            _decref(_int_ptr(self_ptr[].incomplete_tuple))
             self_ptr[].incomplete_tuple = 0
         if self_ptr[].hw_incomplete_tuple != 0:
-            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].hw_incomplete_tuple))
+            _decref(_int_ptr(self_ptr[].hw_incomplete_tuple))
             self_ptr[].hw_incomplete_tuple = 0
         if self_ptr[].none_obj != 0:
-            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].none_obj))
+            _decref(_int_ptr(self_ptr[].none_obj))
             self_ptr[].none_obj = 0
         return PythonObject(0)
 
@@ -586,7 +582,8 @@ struct Reader(Defaultable, Movable, Writable):
                         break
                     var einst = _error_to_instance(
                         re_ptr, self_ptr[].reply_error_weak,
-                        ptr.unsafe_offset(epos + 1), ecrlf - (epos + 1))
+                        ptr.unsafe_offset(epos + 1), ecrlf - (epos + 1),
+                        self_ptr[].none_obj)
                     if einst != 0:
                         self_ptr[].consumed = ecrlf + 2
                         self_ptr[].needs_scan = False
@@ -634,7 +631,9 @@ struct Reader(Defaultable, Movable, Writable):
                 if node.status == ST_REPLY_ERR and re_ptr != 0:
                     var marker = Int(node.payload.steal_data())
                     var callback_error = PyObjectPtr()
-                    var inst = _marker_to_instance(re_ptr, self_ptr[].reply_error_weak, marker, callback_error)
+                    var inst = _marker_to_instance(
+                        re_ptr, self_ptr[].reply_error_weak, marker, callback_error,
+                        self_ptr[].none_obj)
                     if inst != 0:
                         self_ptr[].consumed = node.pos
                         collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
@@ -707,7 +706,6 @@ struct Reader(Defaultable, Movable, Writable):
         status 1: incomplete -> (1, None, None).
         status 2: protocol error (sticky, like gets) -> (2, message, None).
         """
-        ref cpy = Python().cpython()
         if self_ptr[].consumed >= self_ptr[].buf_len:
             return Reader._hw_incomplete_result(self_ptr)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
@@ -730,7 +728,7 @@ struct Reader(Defaultable, Movable, Writable):
             self_ptr[].proto_err = True
             self_ptr[].proto_err_msg = _err_text(res.err_code, res.err_byte)
             return _hw_tuple(
-                cpy.PyLong_FromSsize_t(ST_PROTO_ERR),
+                _long(Int(ST_PROTO_ERR)),
                 _bytes_payload(self_ptr[].proto_err_msg), _none_payload())
         self_ptr[].consumed = res.pos
         # Bound the arena like the classic path does, but only when no view is
@@ -748,9 +746,9 @@ struct Reader(Defaultable, Movable, Writable):
             _write_i64(tp, i * 24 + 16, Int(s.resp_type))
         var arena = PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=self_ptr[].buf_obj))
-        _ = cpy.Py_IncRef(arena)
+        _incref(arena)
         return _hw_tuple(
-            cpy.PyLong_FromSsize_t(ST_OK),
+            _long(Int(ST_OK)),
             PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
                 unsafe_from_address=table)),
             arena)
@@ -808,7 +806,7 @@ def _new_arena(size: Int, src: Int, src_len: Int) raises -> Int:
         var rc = external_call["PyByteArray_Resize", c_int](
             Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(obj)), c_ssize_t(size))
         if rc != 0:
-            _ = Python().cpython().PyErr_Clear()
+            _pyerr_clear()
             raise Error("out of memory")
     return Int(obj)
 
@@ -875,7 +873,7 @@ def _ensure_cap(mut r: Reader, needed: Int) raises:
     var rc = external_call["PyByteArray_Resize", c_int](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj), c_ssize_t(new_cap))
     if rc != 0:
-        _ = Python().cpython().PyErr_Clear()
+        _pyerr_clear()
         _arena_detach(r, new_cap)
         return
     r.buf_cap = new_cap
@@ -899,7 +897,7 @@ def _compact(mut r: Reader):
                 r.buf_cap = r.maxbuf
                 r.buf_addr = Int(_arena_ptr(r.buf_obj))
             else:
-                _ = Python().cpython().PyErr_Clear()
+                _pyerr_clear()
         return
     if r.consumed * 2 >= r.buf_len and r.buf_len > 1024:
         var dst = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr)
@@ -920,11 +918,41 @@ def _int_ptr(value: Int) -> PyObjectPtr:
     return PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](unsafe_from_address=value))
 
 
+# These go through external_call instead of the CPython binding object: that
+# object cannot be shared globally (no module-level var, and comptime values
+# have no runtime address), and its wrapper costs ~1 ns more per call.
+def _incref(p: PyObjectPtr):
+    _ = external_call["Py_IncRef", NoneType](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p)))
+
+
+def _decref(p: PyObjectPtr):
+    _ = external_call["Py_DecRef", NoneType](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p)))
+
+
+def _pyerr_clear():
+    _ = external_call["PyErr_Clear", NoneType]()
+
+
+def _tuple_new(size: Int) -> PyObjectPtr:
+    return external_call["PyTuple_New", PyObjectPtr](c_ssize_t(size))
+
+
+def _tuple_set(t: PyObjectPtr, index: Int, value: PyObjectPtr):
+    _ = external_call["PyTuple_SetItem", c_int](t, c_ssize_t(index), value)
+
+
+def _long(value: Int) -> PyObjectPtr:
+    return external_call["PyLong_FromSsize_t", PyObjectPtr](c_ssize_t(value))
+
+
 def _none_payload() -> PyObjectPtr:
-    # callers wrap this with from_owned, so hand over an owned reference
-    ref cpy = Python().cpython()
-    var none = cpy.Py_None()
-    _ = cpy.Py_IncRef(none)
+    # callers wrap this with from_owned, so hand over an owned reference.
+    # Py_None is a data symbol, so this is the only place that still needs the
+    # CPython binding object.
+    var none = Python().cpython().Py_None()
+    _incref(none)
     return none
 
 
@@ -957,9 +985,14 @@ struct DecodeCtx(ImplicitlyCopyable):
 
 
 def _cached_none(cnv: DecodeCtx) -> PyObjectPtr:
-    """Owned Py_None reference from the Reader's single cached object."""
+    """Owned Py_None reference from the Reader's single cached object.
+
+    Py_IncRef is called through external_call: the CPython binding wrapper
+    costs ~1 ns more per call, and this runs once per nil element.
+    """
     var p = _int_ptr(cnv.none_obj)
-    _ = Python().cpython().Py_IncRef(p)
+    _ = external_call["Py_IncRef", NoneType](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(p)))
     return p
 
 
@@ -991,7 +1024,7 @@ def _leaf_payload(
             return res
         # a Mojo raise would replace the pending codec error, so fall back to
         # bytes and let the wrapper re-raise it
-        _ = Python().cpython().PyErr_Clear()
+        _pyerr_clear()
         cnv.failed = True
     return _bytes_slice_payload(ptr, offset, length)
 
@@ -1002,10 +1035,9 @@ def _bytes_slice_payload(ptr: Pointer[UInt8, MutAnyOrigin], offset: Int, length:
 
 
 def _status_tuple(status: UInt8, payload: PyObjectPtr) raises -> PythonObject:
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(2)
-    _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(Int(status)))
-    _ = cpy.PyTuple_SetItem(t, 1, payload)
+    var t = _tuple_new(2)
+    _tuple_set(t, 0, _long(Int(status)))
+    _tuple_set(t, 1, payload)
     return PythonObject(from_owned=t)
 
 
@@ -1021,28 +1053,25 @@ def _write_i64(ptr: Pointer[UInt8, MutAnyOrigin], offset: Int, value: Int):
 
 def _hw_tuple(a: PyObjectPtr, b: PyObjectPtr, c: PyObjectPtr) raises -> PythonObject:
     """Tuple of three already-owned references (PyTuple_SetItem steals)."""
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(3)
-    _ = cpy.PyTuple_SetItem(t, 0, a)
-    _ = cpy.PyTuple_SetItem(t, 1, b)
-    _ = cpy.PyTuple_SetItem(t, 2, c)
+    var t = _tuple_new(3)
+    _tuple_set(t, 0, a)
+    _tuple_set(t, 1, b)
+    _tuple_set(t, 2, c)
     return PythonObject(from_owned=t)
 
 
 def _prefetch_batch_result(replies: PyObjectPtr, lengths: PyObjectPtr) raises -> PythonObject:
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(3)
-    _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(ST_PREFETCH_BATCH))
-    _ = cpy.PyTuple_SetItem(t, 1, replies)
-    _ = cpy.PyTuple_SetItem(t, 2, lengths)
+    var t = _tuple_new(3)
+    _tuple_set(t, 0, _long(ST_PREFETCH_BATCH))
+    _tuple_set(t, 1, replies)
+    _tuple_set(t, 2, lengths)
     return PythonObject(from_owned=t)
 
 
 def _prefetch_drained_result(payload: PyObjectPtr) raises -> PythonObject:
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(2)
-    _ = cpy.PyTuple_SetItem(t, 0, cpy.PyLong_FromSsize_t(ST_PREFETCH_DRAINED))
-    _ = cpy.PyTuple_SetItem(t, 1, payload)
+    var t = _tuple_new(2)
+    _tuple_set(t, 0, _long(ST_PREFETCH_DRAINED))
+    _tuple_set(t, 1, payload)
     return PythonObject(from_owned=t)
 
 
@@ -1050,14 +1079,13 @@ def _drain_result(
     replies: PyObjectPtr, proto_msg: PyObjectPtr, dict_exc: PyObjectPtr, had_markers: Bool,
     dec_failed: Bool, raise_exc: PyObjectPtr
 ) raises -> PythonObject:
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(6)
-    _ = cpy.PyTuple_SetItem(t, 0, replies)
-    _ = cpy.PyTuple_SetItem(t, 1, proto_msg)
-    _ = cpy.PyTuple_SetItem(t, 2, dict_exc)
-    _ = cpy.PyTuple_SetItem(t, 3, cpy.PyBool_FromLong(1) if had_markers else cpy.PyBool_FromLong(0))
-    _ = cpy.PyTuple_SetItem(t, 4, cpy.PyBool_FromLong(1) if dec_failed else cpy.PyBool_FromLong(0))
-    _ = cpy.PyTuple_SetItem(t, 5, raise_exc)
+    var t = _tuple_new(6)
+    _tuple_set(t, 0, replies)
+    _tuple_set(t, 1, proto_msg)
+    _tuple_set(t, 2, dict_exc)
+    _tuple_set(t, 3, external_call["PyBool_FromLong", PyObjectPtr](c_long(1 if had_markers else 0)))
+    _tuple_set(t, 4, external_call["PyBool_FromLong", PyObjectPtr](c_long(1 if dec_failed else 0)))
+    _tuple_set(t, 5, raise_exc)
     return PythonObject(from_owned=t)
 
 
@@ -1075,14 +1103,13 @@ def _list_of(imm collected: List[PyObjectPtr]) raises -> PyObjectPtr:
     return lst
 
 
-def _marker_to_instance(re_ptr: Int, weak: Bool, marker_ptr: Int, mut raised: PyObjectPtr) -> Int:
+def _marker_to_instance(re_ptr: Int, weak: Bool, marker_ptr: Int, mut raised: PyObjectPtr, none_ptr: Int) -> Int:
     """Turn an error marker tuple into a replyError instance in the core.
 
     Returns 0 and stores the raised exception in `raised` when the callable
     fails. PyErr_GetRaisedException clears the C error indicator while
     preserving the original exception and traceback for the Python wrapper.
     """
-    ref cpy = Python().cpython()
     var msg = external_call["PyTuple_GetItem", PyObjectPtr](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=marker_ptr), c_ssize_t(1))
     if Int(msg) == 0:
@@ -1096,10 +1123,10 @@ def _marker_to_instance(re_ptr: Int, weak: Bool, marker_ptr: Int, mut raised: Py
     if Int(callable) == 0:
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
-    if Int(callable) == Int(cpy.Py_None()):
+    if Int(callable) == none_ptr:
         # dead weakref: drain falls back to the wrapper's own callable
         if owned:
-            _ = cpy.Py_DecRef(callable)
+            _ = _decref(callable)
         return 0
     var enc = String("utf-8")
     var errs = String("replace")
@@ -1109,15 +1136,15 @@ def _marker_to_instance(re_ptr: Int, weak: Bool, marker_ptr: Int, mut raised: Py
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(errs.unsafe_ptr())))
     if Int(text) == 0:
         if owned:
-            _ = cpy.Py_DecRef(callable)
+            _ = _decref(callable)
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
     var inst = external_call["PyObject_CallOneArg", PyObjectPtr](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(callable)),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(text)))
-    _ = cpy.Py_DecRef(text)
+    _ = _decref(text)
     if owned:
-        _ = cpy.Py_DecRef(callable)
+        _ = _decref(callable)
     if Int(inst) == 0:
         raised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
         return 0
@@ -1139,7 +1166,7 @@ def _resolve_reply_error(re_ptr: Int, weak: Bool, mut owned: Bool) -> PyObjectPt
 
 
 def _error_to_instance(
-    re_ptr: Int, weak: Bool, msg_ptr: Pointer[UInt8, MutAnyOrigin], msg_len: Int
+    re_ptr: Int, weak: Bool, msg_ptr: Pointer[UInt8, MutAnyOrigin], msg_len: Int, none_ptr: Int
 ) -> Int:
     """Build a replyError instance straight from the error line bytes.
 
@@ -1148,7 +1175,6 @@ def _error_to_instance(
     CPython exception left pending when the factory or a C call failed, so the
     caller can propagate it directly with its traceback.
     """
-    ref cpy = Python().cpython()
     var enc = String("utf-8")
     var errs = String("replace")
     var text = external_call["PyUnicode_Decode", PyObjectPtr](
@@ -1160,19 +1186,19 @@ def _error_to_instance(
     var owned = False
     var callable = _resolve_reply_error(re_ptr, weak, owned)
     if Int(callable) == 0:
-        _ = cpy.Py_DecRef(text)
+        _ = _decref(text)
         return 0
-    if Int(callable) == Int(cpy.Py_None()):
-        _ = cpy.Py_DecRef(text)
+    if Int(callable) == none_ptr:
+        _ = _decref(text)
         if owned:
-            _ = cpy.Py_DecRef(callable)
+            _ = _decref(callable)
         return 0
     var inst = external_call["PyObject_CallOneArg", PyObjectPtr](
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(callable)),
         Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(text)))
-    _ = cpy.Py_DecRef(text)
+    _ = _decref(text)
     if owned:
-        _ = cpy.Py_DecRef(callable)
+        _ = _decref(callable)
     if Int(inst) == 0:
         return 0
     return Int(inst)
@@ -1180,20 +1206,17 @@ def _error_to_instance(
 
 def _push_marker(payload: PyObjectPtr) raises -> PyObjectPtr:
     """Nested push reply → (sentinel_bytes, payload); the wrapper wraps it."""
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(2)
-    _ = cpy.PyTuple_SetItem(t, 0, _bytes_payload(String(PUSH_SENTINEL)))
-    _ = cpy.PyTuple_SetItem(t, 1, payload)
+    var t = _tuple_new(2)
+    _tuple_set(t, 0, _bytes_payload(String(PUSH_SENTINEL)))
+    _tuple_set(t, 1, payload)
     return t
 
 
 def _error_marker(msg_ptr: Pointer[UInt8, MutAnyOrigin], length: Int) raises -> PyObjectPtr:
     """Nested error reply → (sentinel_bytes, message_bytes)."""
-    ref cpy = Python().cpython()
-    var t = cpy.PyTuple_New(2)
-    var sentinel = _bytes_payload(String(ERR_SENTINEL))
-    _ = cpy.PyTuple_SetItem(t, 0, sentinel)
-    _ = cpy.PyTuple_SetItem(t, 1, _bytes_slice_payload(msg_ptr, 0, length))
+    var t = _tuple_new(2)
+    _tuple_set(t, 0, _bytes_payload(String(ERR_SENTINEL)))
+    _tuple_set(t, 1, _bytes_slice_payload(msg_ptr, 0, length))
     return t
 
 
@@ -1815,8 +1838,8 @@ def _parse_node(
             var value = _parse_int_line(ptr, pstart, crlf, after_crlf, status)
             if status == ST_PROTO_ERR:
                 return _proto_node(start, ERR_BAD_INT)
-            ref cpy = Python().cpython()
-            return Node(ST_OK, after_crlf, PythonObject(from_owned=cpy.PyLong_FromSsize_t(value)))
+            return Node(ST_OK, after_crlf, PythonObject(from_owned=external_call[
+                "PyLong_FromSsize_t", PyObjectPtr](c_ssize_t(value))))
         if t == TYPE_ERROR:
             var err_node = Node(ST_REPLY_ERR, crlf + 2, PythonObject(from_owned=_error_marker(ptr.unsafe_offset(pstart), plen)))
             err_node.had_err = True
@@ -1883,7 +1906,7 @@ def _parse_node(
             # (measured), and most elements are one of these three types.
             if pos >= end:
                 # the previous element consumed exactly to the chunk end
-                _ = cpy.Py_DecRef(list_obj)
+                _ = _decref(list_obj)
                 return _incomplete_node(start)
             var t2 = ptr.unsafe_offset(pos)[]
             if t2 == TYPE_BULK:
@@ -1891,20 +1914,20 @@ def _parse_node(
                 var st2: UInt8 = ST_OK
                 var blen2 = _read_len_fast(ptr, pos + 1, end, after2, st2)
                 if st2 == ST_INCOMPLETE:
-                    _ = cpy.Py_DecRef(list_obj)
+                    _ = _decref(list_obj)
                     return _incomplete_node(start)
                 if st2 == ST_PROTO_ERR:
-                    _ = cpy.Py_DecRef(list_obj)
+                    _ = _decref(list_obj)
                     return _proto_node(start, ERR_BAD_BULK_LEN)
                 if blen2 < -1:
-                    _ = cpy.Py_DecRef(list_obj)
+                    _ = _decref(list_obj)
                     return _proto_node(start, ERR_BULK_RANGE)
                 if blen2 == -1:
                     _ = cpy.PyList_SetItem(list_obj, i, _cached_none(cnv))
                     pos = after2
                 else:
                     if after2 + blen2 + 2 > end:
-                        _ = cpy.Py_DecRef(list_obj)
+                        _ = _decref(list_obj)
                         return _incomplete_node(start)
                     # decoding is per-Reader, so hoist the check out of the
                     # helper: the common no-encoding path skips its frame
@@ -1919,18 +1942,18 @@ def _parse_node(
                 var st2: UInt8 = ST_OK
                 var value2 = _read_int(ptr, pos + 1, end, after2, st2)
                 if st2 == ST_INCOMPLETE:
-                    _ = cpy.Py_DecRef(list_obj)
+                    _ = _decref(list_obj)
                     return _incomplete_node(start)
                 if st2 == ST_PROTO_ERR:
-                    _ = cpy.Py_DecRef(list_obj)
+                    _ = _decref(list_obj)
                     return _proto_node(start, ERR_BAD_INT)
-                _ = cpy.PyList_SetItem(list_obj, i, cpy.PyLong_FromSsize_t(value2))
+                _ = cpy.PyList_SetItem(list_obj, i, _long(value2))
                 pos = after2
                 continue
             if t2 == TYPE_SIMPLE or t2 == TYPE_ERROR:
                 var crlf2 = _find_crlf(ptr, pos + 1, end)
                 if crlf2 < 0:
-                    _ = cpy.Py_DecRef(list_obj)
+                    _ = _decref(list_obj)
                     return _incomplete_node(start)
                 var pstart2 = pos + 1
                 if t2 == TYPE_ERROR:
@@ -1950,13 +1973,13 @@ def _parse_node(
                 continue
             var child = _parse_node(ptr, pos, end, depth + 1, cnv)
             if child.status == ST_INCOMPLETE:
-                _ = cpy.Py_DecRef(list_obj)
+                _ = _decref(list_obj)
                 return _incomplete_node(start)
             if child.status == ST_PROTO_ERR:
-                _ = cpy.Py_DecRef(list_obj)
+                _ = _decref(list_obj)
                 return _proto_node_byte(start, child.err_code, child.err_byte)
             if child.status == ST_DICT_ERR:
-                _ = cpy.Py_DecRef(list_obj)
+                _ = _decref(list_obj)
                 return child^
             if child.had_err:
                 saw_err = True
@@ -1979,7 +2002,8 @@ def _parse_node(
         var derr = _double_parse(ptr, start + 1, crlf, dval)
         if derr != ERR_NONE:
             return _proto_node(start, derr)
-        return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(dval)))
+        return Node(ST_OK, crlf + 2, PythonObject(from_owned=external_call[
+            "PyFloat_FromDouble", PyObjectPtr](dval)))
     if t == TYPE_BOOL:  # '#' bool: #t\r\n / #f\r\n
         if start + 2 > end:
             return _incomplete_node(start)
@@ -1990,10 +2014,11 @@ def _parse_node(
             return _incomplete_node(start)
         if ptr.unsafe_offset(start + 2)[] != CR or ptr.unsafe_offset(start + 3)[] != LF:
             return _proto_node(start, ERR_BAD_BOOL)
-        ref cpy2 = Python().cpython()
         if bval == 116 or bval == 84:
-            return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(1)))
-        return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(0)))
+            return Node(ST_OK, start + 4, PythonObject(from_owned=external_call[
+                "PyBool_FromLong", PyObjectPtr](c_long(1))))
+        return Node(ST_OK, start + 4, PythonObject(from_owned=external_call[
+            "PyBool_FromLong", PyObjectPtr](c_long(0))))
     if t == TYPE_NULL:  # '_' null
         if start + 3 > end:
             return _incomplete_node(start)
