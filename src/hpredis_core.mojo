@@ -18,6 +18,26 @@ comptime TYPE_SIMPLE = 43  # '+'
 comptime TYPE_ERROR = 45  # '-'
 comptime TYPE_INT = 58  # ':'
 
+# protocol-error codes: POD on Node/ScanResult; _err_text maps them to
+# hiredis' exact messages only when an error actually surfaces
+comptime ERR_NONE = 0
+comptime ERR_BAD_INT = 1
+comptime ERR_BAD_BULK_LEN = 2
+comptime ERR_BULK_RANGE = 3
+comptime ERR_BAD_MULTI_LEN = 4
+comptime ERR_MULTI_RANGE = 5
+comptime ERR_MAX_DEPTH = 6
+comptime ERR_BAD_DOUBLE = 7
+comptime ERR_DOUBLE_LARGE = 8
+comptime ERR_BAD_BOOL = 9
+comptime ERR_BAD_NULL = 10
+comptime ERR_BAD_VERBATIM = 11
+comptime ERR_BAD_SET = 12
+comptime ERR_BAD_MAP = 13
+comptime ERR_BAD_ATTR = 14
+comptime ERR_BAD_BIGNUM = 15
+comptime ERR_UNKNOWN_TYPE = 16
+
 # try_gets status codes
 comptime ST_OK = 0
 comptime ST_INCOMPLETE = 1
@@ -66,7 +86,10 @@ struct Node(Movable):
     var status: UInt8
     var pos: Int
     var payload: PythonObject
-    var err_msg: String
+    # protocol-error code + dynamic byte (see _err_text); POD, so successful
+    # nodes never build a String
+    var err_code: UInt8
+    var err_byte: UInt8
     # True when the wrapper must finalize the payload: a nested error reply
     # or a nested push (both carry marker tuples)
     var had_err: Bool
@@ -75,14 +98,24 @@ struct Node(Movable):
         self.status = status
         self.pos = pos
         self.payload = payload
-        self.err_msg = String()
+        self.err_code = ERR_NONE
+        self.err_byte = 0
         self.had_err = False
 
-    def __init__(out self, status: UInt8, pos: Int, payload: PythonObject, err_msg: String):
+    def __init__(out self, status: UInt8, pos: Int, payload: PythonObject, err_code: UInt8):
         self.status = status
         self.pos = pos
         self.payload = payload
-        self.err_msg = err_msg
+        self.err_code = err_code
+        self.err_byte = 0
+        self.had_err = False
+
+    def __init__(out self, status: UInt8, pos: Int, payload: PythonObject, err_code: UInt8, err_byte: UInt8):
+        self.status = status
+        self.pos = pos
+        self.payload = payload
+        self.err_code = err_code
+        self.err_byte = err_byte
         self.had_err = False
 
 
@@ -296,8 +329,8 @@ struct Reader(Defaultable, Movable, Writable):
             return _status_tuple(ST_DICT_ERR, node.payload.steal_data())
         # protocol error: sticky, not consumed
         self_ptr[].proto_err = True
-        self_ptr[].proto_err_msg = node.err_msg
-        return _status_tuple(ST_PROTO_ERR, node.payload.steal_data())
+        self_ptr[].proto_err_msg = _err_text(node.err_code, node.err_byte)
+        return _status_tuple(ST_PROTO_ERR, _bytes_payload(self_ptr[].proto_err_msg))
 
     @staticmethod
     def prefetch_clean(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
@@ -505,10 +538,10 @@ struct Reader(Defaultable, Movable, Writable):
                         break
                     # sticky and not consumed (matches gets)
                     self_ptr[].proto_err = True
-                    self_ptr[].proto_err_msg = node.err_msg
+                    self_ptr[].proto_err_msg = _err_text(node.err_code, node.err_byte)
                     _ = _compact(self_ptr[])
                     return _drain_result(
-                        _list_of(collected), _bytes_payload(node.err_msg), _none_payload(),
+                        _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), _none_payload(),
                         False, cnv.failed, _none_payload())
                 if node.status == ST_REPLY_ERR and re_ptr != 0:
                     var marker = Int(node.payload.steal_data())
@@ -597,9 +630,10 @@ struct Reader(Defaultable, Movable, Writable):
             return _hw_tuple(cpy.PyLong_FromSsize_t(ST_INCOMPLETE), _none_payload(), _none_payload())
         if res.status == ST_PROTO_ERR:
             self_ptr[].proto_err = True
-            self_ptr[].proto_err_msg = res.err_msg
+            self_ptr[].proto_err_msg = _err_text(res.err_code, res.err_byte)
             return _hw_tuple(
-                cpy.PyLong_FromSsize_t(ST_PROTO_ERR), _bytes_payload(res.err_msg), _none_payload())
+                cpy.PyLong_FromSsize_t(ST_PROTO_ERR),
+                _bytes_payload(self_ptr[].proto_err_msg), _none_payload())
         self_ptr[].consumed = res.pos
         # Bound the arena like the classic path does, but only when no view is
         # alive: an exported bytearray must not be rewritten under its readers.
@@ -873,10 +907,13 @@ def _status_tuple(status: UInt8, payload: PyObjectPtr) raises -> PythonObject:
 
 
 def _write_i64(ptr: Pointer[UInt8, MutAnyOrigin], offset: Int, value: Int):
-    """Little-endian int64 store (numpy '<i8' on the consumer side)."""
-    var v = UInt64(value)
-    for k in range(8):
-        ptr.unsafe_offset(offset + k)[] = UInt8((v >> UInt64(8 * k)) & 0xFF)
+    """Little-endian int64 store (numpy '<i8' on the consumer side).
+
+    The table is a malloc-aligned bytearray and every offset is a multiple of
+    8, so one native 64-bit store replaces 8 byte stores (the supported
+    targets are little-endian).
+    """
+    Pointer[UInt64, MutAnyOrigin](unsafe_from_address=Int(ptr) + offset)[] = UInt64(value)
 
 
 def _hw_tuple(a: PyObjectPtr, b: PyObjectPtr, c: PyObjectPtr) raises -> PythonObject:
@@ -1230,8 +1267,12 @@ def _parse_int_line(
         return Int(value)
 
 
-def _proto_node(pos: Int, msg: String) raises -> Node:
-    return Node(ST_PROTO_ERR, pos, PythonObject(from_owned=_bytes_payload(msg)), msg)
+def _proto_node(pos: Int, err_code: UInt8) raises -> Node:
+    return Node(ST_PROTO_ERR, pos, PythonObject(from_owned=_none_payload()), err_code)
+
+
+def _proto_node_byte(pos: Int, err_code: UInt8, err_byte: UInt8) raises -> Node:
+    return Node(ST_PROTO_ERR, pos, PythonObject(from_owned=_none_payload()), err_code, err_byte)
 
 
 def _incomplete_node(pos: Int) raises -> Node:
@@ -1248,25 +1289,20 @@ struct ScanResult(ImplicitlyCopyable):
     """Scan outcome: like Node but without any Python objects."""
     var status: UInt8
     var pos: Int
-    var err_msg: String
+    var err_code: UInt8
+    var err_byte: UInt8
 
     def __init__(out self, status: UInt8, pos: Int):
         self.status = status
         self.pos = pos
-        self.err_msg = String()
+        self.err_code = ERR_NONE
+        self.err_byte = 0
 
-    def __init__(out self, status: UInt8, pos: Int, err_msg: String):
+    def __init__(out self, status: UInt8, pos: Int, err_code: UInt8, err_byte: UInt8):
         self.status = status
         self.pos = pos
-        self.err_msg = err_msg
-
-
-def _scan_err[HIGHWAY: Bool](start: Int, msg: String) -> ScanResult:
-    """Protocol error result: only highway mode carries the exact message."""
-    if HIGHWAY:
-        return ScanResult(ST_PROTO_ERR, start, msg)
-    else:
-        return ScanResult(ST_PROTO_ERR, start)
+        self.err_code = err_code
+        self.err_byte = err_byte
 
 
 def _scan_resp[HIGHWAY: Bool](
@@ -1309,9 +1345,9 @@ def _scan_resp[HIGHWAY: Bool](
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
-            return _scan_err[HIGHWAY](start, String("Bad bulk string length"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BULK_LEN, 0)
         if blen < -1:
-            return _scan_err[HIGHWAY](start, String("Bulk string length out of range"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BULK_RANGE, 0)
         if blen == -1:
             if HIGHWAY:
                 _record_slice(slices, start - base, -1, TYPE_BULK)  # nil row
@@ -1327,7 +1363,7 @@ def _scan_resp[HIGHWAY: Bool](
         if crlf < 0:
             return ScanResult(ST_INCOMPLETE, start)
         if not _bignum_ok(ptr, start + 1, crlf):
-            return _scan_err[HIGHWAY](start, String("Bad bignum value"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BIGNUM, 0)
         if HIGHWAY:
             _record_slice(slices, start + 1 - base, crlf - (start + 1), t)
         return ScanResult(ST_OK, crlf + 2)
@@ -1338,21 +1374,21 @@ def _scan_resp[HIGHWAY: Bool](
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
-            return _scan_err[HIGHWAY](start, String("Bad multi-bulk length"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_MULTI_LEN, 0)
         if count > MAX_CONTAINER_ELEMENTS:
-            return _scan_err[HIGHWAY](start, String("Multi-bulk length out of range"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MULTI_RANGE, 0)
         if t == 124:
             if count < 0:
-                return _scan_err[HIGHWAY](start, String("Bad attribute length"))
+                return ScanResult(ST_PROTO_ERR, start, ERR_BAD_ATTR, 0)
             count *= 2
         elif count < -1:
-            return _scan_err[HIGHWAY](start, String("Multi-bulk length out of range"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MULTI_RANGE, 0)
         elif count == -1:
             if HIGHWAY:
                 _record_slice(slices, start - base, -1, t)  # nil container row
             return ScanResult(ST_OK, after_int)
         if depth > MAX_DEPTH:
-            return _scan_err[HIGHWAY](start, String("Max nesting depth exceeded"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MAX_DEPTH, 0)
         if count > (end - after_int) // 3:
             return ScanResult(ST_INCOMPLETE, start)
         if HIGHWAY:
@@ -1361,7 +1397,7 @@ def _scan_resp[HIGHWAY: Bool](
         for _i in range(count):
             var child = _scan_resp[HIGHWAY](ptr, pos, end, slices, base, depth + 1)
             if child.status == ST_PROTO_ERR:
-                return _scan_err[HIGHWAY](start, child.err_msg)
+                return ScanResult(ST_PROTO_ERR, start, child.err_code, child.err_byte)
             if child.status == ST_INCOMPLETE:
                 return ScanResult(ST_INCOMPLETE, start)
             pos = child.pos
@@ -1373,11 +1409,11 @@ def _scan_resp[HIGHWAY: Bool](
         if status2 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status2 == ST_PROTO_ERR or count2 < 0:
-            return _scan_err[HIGHWAY](start, String("Bad set length"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_SET, 0)
         if count2 > MAX_CONTAINER_ELEMENTS:
-            return _scan_err[HIGHWAY](start, String("Multi-bulk length out of range"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MULTI_RANGE, 0)
         if depth > MAX_DEPTH:
-            return _scan_err[HIGHWAY](start, String("Max nesting depth exceeded"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MAX_DEPTH, 0)
         if count2 > (end - after_int2) // 3:
             return ScanResult(ST_INCOMPLETE, start)
         if HIGHWAY:
@@ -1386,7 +1422,7 @@ def _scan_resp[HIGHWAY: Bool](
         for _i2 in range(count2):
             var child2 = _scan_resp[HIGHWAY](ptr, spos, end, slices, base, depth + 1)
             if child2.status == ST_PROTO_ERR:
-                return _scan_err[HIGHWAY](start, child2.err_msg)
+                return ScanResult(ST_PROTO_ERR, start, child2.err_code, child2.err_byte)
             if child2.status == ST_INCOMPLETE:
                 return ScanResult(ST_INCOMPLETE, start)
             spos = child2.pos
@@ -1398,11 +1434,11 @@ def _scan_resp[HIGHWAY: Bool](
         if status3 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status3 == ST_PROTO_ERR or pairs < 0:
-            return _scan_err[HIGHWAY](start, String("Bad map length"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_MAP, 0)
         if pairs > MAX_CONTAINER_ELEMENTS:
-            return _scan_err[HIGHWAY](start, String("Multi-bulk length out of range"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MULTI_RANGE, 0)
         if depth > MAX_DEPTH:
-            return _scan_err[HIGHWAY](start, String("Max nesting depth exceeded"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_MAX_DEPTH, 0)
         if pairs > (end - after_int3) // 6:
             return ScanResult(ST_INCOMPLETE, start)
         if HIGHWAY:
@@ -1411,13 +1447,13 @@ def _scan_resp[HIGHWAY: Bool](
         for _i3 in range(pairs):
             var key_node = _scan_resp[HIGHWAY](ptr, mpos, end, slices, base, depth + 1)
             if key_node.status == ST_PROTO_ERR:
-                return _scan_err[HIGHWAY](start, key_node.err_msg)
+                return ScanResult(ST_PROTO_ERR, start, key_node.err_code, key_node.err_byte)
             if key_node.status == ST_INCOMPLETE:
                 return ScanResult(ST_INCOMPLETE, start)
             mpos = key_node.pos
             var val_node = _scan_resp[HIGHWAY](ptr, mpos, end, slices, base, depth + 1)
             if val_node.status == ST_PROTO_ERR:
-                return _scan_err[HIGHWAY](start, val_node.err_msg)
+                return ScanResult(ST_PROTO_ERR, start, val_node.err_code, val_node.err_byte)
             if val_node.status == ST_INCOMPLETE:
                 return ScanResult(ST_INCOMPLETE, start)
             mpos = val_node.pos
@@ -1429,7 +1465,7 @@ def _scan_resp[HIGHWAY: Bool](
         if status4 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status4 == ST_PROTO_ERR or vlen < 0:
-            return _scan_err[HIGHWAY](start, String("Bad verbatim string length"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_VERBATIM, 0)
         var pstart4 = after_int4
         if vlen > end - pstart4 - 2:
             return ScanResult(ST_INCOMPLETE, start)
@@ -1447,11 +1483,11 @@ def _scan_resp[HIGHWAY: Bool](
             return ScanResult(ST_INCOMPLETE, start)
         var bval = ptr.unsafe_offset(start + 1)[]
         if not _bool_ok(Int(bval)):
-            return _scan_err[HIGHWAY](start, String("Bad bool value"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BOOL, 0)
         if start + 4 > end:
             return ScanResult(ST_INCOMPLETE, start)
         if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
-            return _scan_err[HIGHWAY](start, String("Bad bool value"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BOOL, 0)
         if HIGHWAY:
             _record_slice(slices, start + 1 - base, 1, 35)  # 't'/'f' byte
         return ScanResult(ST_OK, start + 4)
@@ -1459,18 +1495,12 @@ def _scan_resp[HIGHWAY: Bool](
         if start + 3 > end:
             return ScanResult(ST_INCOMPLETE, start)
         if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
-            return _scan_err[HIGHWAY](start, String("Protocol error: invalid null reply"))
+            return ScanResult(ST_PROTO_ERR, start, ERR_BAD_NULL, 0)
         if HIGHWAY:
             _record_slice(slices, start - base, -1, 95)  # null row
         return ScanResult(ST_OK, start + 3)
-    if HIGHWAY:
-        var msg = String("Protocol error, got ")
-        msg += _hex_byte(Int(t))
-        msg += " as reply type byte"
-        return ScanResult(ST_PROTO_ERR, start, msg)
-    else:
-        # unknown type byte: let the builder produce the exact error text
-        return ScanResult(ST_PROTO_ERR, start)
+    # unknown type byte: the dynamic byte is kept for _err_text
+    return ScanResult(ST_PROTO_ERR, start, ERR_UNKNOWN_TYPE, t)
 
 
 def _scan_node(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth: Int) -> ScanResult:
@@ -1553,7 +1583,7 @@ def _parse_node(
             if status == ST_INCOMPLETE:
                 return _incomplete_node(start)
             if status == ST_PROTO_ERR:
-                return _proto_node(start, "Bad integer value")
+                return _proto_node(start, ERR_BAD_INT)
             ref cpy = Python().cpython()
             return Node(ST_OK, after_crlf, PythonObject(from_owned=cpy.PyLong_FromSsize_t(value)))
         if t == TYPE_ERROR:
@@ -1569,9 +1599,9 @@ def _parse_node(
         if status == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status == ST_PROTO_ERR:
-            return _proto_node(start, "Bad bulk string length")
+            return _proto_node(start, ERR_BAD_BULK_LEN)
         if blen < -1:
-            return _proto_node(start, "Bulk string length out of range")
+            return _proto_node(start, ERR_BULK_RANGE)
         if blen == -1:
             return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
         var pstart = after_int
@@ -1585,7 +1615,7 @@ def _parse_node(
         if crlf < 0:
             return _incomplete_node(start)
         if not _bignum_ok(ptr, start + 1, crlf):
-            return _proto_node(start, "Bad bignum value")
+            return _proto_node(start, ERR_BAD_BIGNUM)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=_leaf_payload(ptr, start + 1, crlf - (start + 1), cnv)))
     if t == TYPE_ARRAY or t == 62 or t == 124:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
@@ -1594,20 +1624,20 @@ def _parse_node(
         if status == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status == ST_PROTO_ERR:
-            return _proto_node(start, "Bad multi-bulk length")
+            return _proto_node(start, ERR_BAD_MULTI_LEN)
         if count > MAX_CONTAINER_ELEMENTS:
-            return _proto_node(start, "Multi-bulk length out of range")
+            return _proto_node(start, ERR_MULTI_RANGE)
         if t == 124:
             # attributes flatten N key/value pairs into one list (hiredis-py)
             if count < 0:
-                return _proto_node(start, "Bad attribute length")
+                return _proto_node(start, ERR_BAD_ATTR)
             count *= 2
         elif count < -1:
-            return _proto_node(start, "Multi-bulk length out of range")
+            return _proto_node(start, ERR_MULTI_RANGE)
         elif count == -1:
             return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
         if depth > MAX_DEPTH:
-            return _proto_node(start, "Max nesting depth exceeded")
+            return _proto_node(start, ERR_MAX_DEPTH)
         if count > (end - after_int) // 3:
             # fewer than 3 bytes per element left: this reply can never complete
             return _incomplete_node(start)
@@ -1634,10 +1664,10 @@ def _parse_node(
                     return _incomplete_node(start)
                 if st2 == ST_PROTO_ERR:
                     _ = cpy.Py_DecRef(list_obj)
-                    return _proto_node(start, "Bad bulk string length")
+                    return _proto_node(start, ERR_BAD_BULK_LEN)
                 if blen2 < -1:
                     _ = cpy.Py_DecRef(list_obj)
-                    return _proto_node(start, "Bulk string length out of range")
+                    return _proto_node(start, ERR_BULK_RANGE)
                 if blen2 == -1:
                     _ = cpy.PyList_SetItem(list_obj, i, _none_payload())
                     pos = after2
@@ -1662,7 +1692,7 @@ def _parse_node(
                     return _incomplete_node(start)
                 if st2 == ST_PROTO_ERR:
                     _ = cpy.Py_DecRef(list_obj)
-                    return _proto_node(start, "Bad integer value")
+                    return _proto_node(start, ERR_BAD_INT)
                 _ = cpy.PyList_SetItem(list_obj, i, cpy.PyLong_FromSsize_t(value2))
                 pos = after2
                 continue
@@ -1693,7 +1723,7 @@ def _parse_node(
                 return _incomplete_node(start)
             if child.status == ST_PROTO_ERR:
                 _ = cpy.Py_DecRef(list_obj)
-                return _proto_node(start, child.err_msg)
+                return _proto_node_byte(start, child.err_code, child.err_byte)
             if child.status == ST_DICT_ERR:
                 _ = cpy.Py_DecRef(list_obj)
                 return child^
@@ -1716,9 +1746,9 @@ def _parse_node(
             return _incomplete_node(start)
         var pstart = start + 1
         if crlf - pstart >= 326:  # hiredis char buf[326]
-            return _proto_node(start, "Double value is too large")
+            return _proto_node(start, ERR_DOUBLE_LARGE)
         if not _double_chars_ok(ptr, pstart, crlf):
-            return _proto_node(start, "Bad double value")
+            return _proto_node(start, ERR_BAD_DOUBLE)
         # borrow the CRLF byte as strtod's NUL terminator, then restore it
         ptr.unsafe_offset(crlf)[] = 0
         var errno_ptr = external_call["__errno_location", Pointer[c_int, MutAnyOrigin]]()
@@ -1728,18 +1758,18 @@ def _parse_node(
         var err = errno_ptr[]  # ERANGE == 34: overflow and underflow both fail
         ptr.unsafe_offset(crlf)[] = 13
         if Int(endp) != Int(ptr) + crlf or err == 34:
-            return _proto_node(start, "Bad double value")
+            return _proto_node(start, ERR_BAD_DOUBLE)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(dval)))
     if t == 35:  # '#' bool: #t\r\n / #f\r\n
         if start + 2 > end:
             return _incomplete_node(start)
         var bval = ptr.unsafe_offset(start + 1)[]
         if not _bool_ok(Int(bval)):
-            return _proto_node(start, "Bad bool value")
+            return _proto_node(start, ERR_BAD_BOOL)
         if start + 4 > end:
             return _incomplete_node(start)
         if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
-            return _proto_node(start, "Bad bool value")
+            return _proto_node(start, ERR_BAD_BOOL)
         ref cpy2 = Python().cpython()
         if bval == 116 or bval == 84:
             return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(1)))
@@ -1748,7 +1778,7 @@ def _parse_node(
         if start + 3 > end:
             return _incomplete_node(start)
         if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
-            return _proto_node(start, "Protocol error: invalid null reply")
+            return _proto_node(start, ERR_BAD_NULL)
         return Node(ST_OK, start + 3, PythonObject(from_owned=_none_payload()))
     if t == 61:  # '=' verbatim string
         var after_int = start + 1
@@ -1757,7 +1787,7 @@ def _parse_node(
         if status == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status == ST_PROTO_ERR or vlen < 0:
-            return _proto_node(start, "Bad verbatim string length")
+            return _proto_node(start, ERR_BAD_VERBATIM)
         var pstart = after_int
         if vlen > end - pstart - 2:
             return _incomplete_node(start)
@@ -1775,11 +1805,11 @@ def _parse_node(
         if status2 == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status2 == ST_PROTO_ERR or count2 < 0:
-            return _proto_node(start, "Bad set length")
+            return _proto_node(start, ERR_BAD_SET)
         if count2 > MAX_CONTAINER_ELEMENTS:
-            return _proto_node(start, "Multi-bulk length out of range")
+            return _proto_node(start, ERR_MULTI_RANGE)
         if depth > MAX_DEPTH:
-            return _proto_node(start, "Max nesting depth exceeded")
+            return _proto_node(start, ERR_MAX_DEPTH)
         if count2 > (end - after_int2) // 3:
             return _incomplete_node(start)
         ref cpy3 = Python().cpython()
@@ -1793,7 +1823,7 @@ def _parse_node(
                 return _incomplete_node(start)
             if child2.status == ST_PROTO_ERR:
                 _ = cpy3.Py_DecRef(set_list)
-                return _proto_node(start, child2.err_msg)
+                return _proto_node_byte(start, child2.err_code, child2.err_byte)
             if child2.status == ST_DICT_ERR:
                 _ = cpy3.Py_DecRef(set_list)
                 return child2^
@@ -1815,11 +1845,11 @@ def _parse_node(
         if status3 == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status3 == ST_PROTO_ERR or pairs < 0:
-            return _proto_node(start, "Bad map length")
+            return _proto_node(start, ERR_BAD_MAP)
         if pairs > MAX_CONTAINER_ELEMENTS:
-            return _proto_node(start, "Multi-bulk length out of range")
+            return _proto_node(start, ERR_MULTI_RANGE)
         if depth > MAX_DEPTH:
-            return _proto_node(start, "Max nesting depth exceeded")
+            return _proto_node(start, ERR_MAX_DEPTH)
         if pairs > (end - after_int3) // 6:
             return _incomplete_node(start)
         ref cpy4 = Python().cpython()
@@ -1833,7 +1863,7 @@ def _parse_node(
                 return _incomplete_node(start)
             if key_node.status == ST_PROTO_ERR:
                 _ = cpy4.Py_DecRef(dict_obj)
-                return _proto_node(start, key_node.err_msg)
+                return _proto_node_byte(start, key_node.err_code, key_node.err_byte)
             if key_node.status == ST_DICT_ERR:
                 _ = cpy4.Py_DecRef(dict_obj)
                 return key_node^
@@ -1846,7 +1876,7 @@ def _parse_node(
                 return _incomplete_node(start)
             if val_node.status == ST_PROTO_ERR:
                 _ = cpy4.Py_DecRef(dict_obj)
-                return _proto_node(start, val_node.err_msg)
+                return _proto_node_byte(start, val_node.err_code, val_node.err_byte)
             if val_node.status == ST_DICT_ERR:
                 _ = cpy4.Py_DecRef(dict_obj)
                 return val_node^
@@ -1873,10 +1903,7 @@ def _parse_node(
         var map_node = Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
         map_node.had_err = saw_err3
         return map_node^
-    var msg = String("Protocol error, got ")
-    msg += _hex_byte(Int(t))
-    msg += " as reply type byte"
-    return _proto_node(start, msg)
+    return _proto_node_byte(start, ERR_UNKNOWN_TYPE, t)
 
 
 def _find_byte(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, byte: UInt8) -> Int:
@@ -1886,6 +1913,46 @@ def _find_byte(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, byte: UI
         return -1
     return Int(hit) - Int(ptr)
 
+
+
+def _err_text(err_code: UInt8, err_byte: UInt8) -> String:
+    """Map a protocol-error code to hiredis' exact message text."""
+    if err_code == ERR_BAD_INT:
+        return String("Bad integer value")
+    if err_code == ERR_BAD_BULK_LEN:
+        return String("Bad bulk string length")
+    if err_code == ERR_BULK_RANGE:
+        return String("Bulk string length out of range")
+    if err_code == ERR_BAD_MULTI_LEN:
+        return String("Bad multi-bulk length")
+    if err_code == ERR_MULTI_RANGE:
+        return String("Multi-bulk length out of range")
+    if err_code == ERR_MAX_DEPTH:
+        return String("Max nesting depth exceeded")
+    if err_code == ERR_BAD_DOUBLE:
+        return String("Bad double value")
+    if err_code == ERR_DOUBLE_LARGE:
+        return String("Double value is too large")
+    if err_code == ERR_BAD_BOOL:
+        return String("Bad bool value")
+    if err_code == ERR_BAD_NULL:
+        return String("Protocol error: invalid null reply")
+    if err_code == ERR_BAD_VERBATIM:
+        return String("Bad verbatim string length")
+    if err_code == ERR_BAD_SET:
+        return String("Bad set length")
+    if err_code == ERR_BAD_MAP:
+        return String("Bad map length")
+    if err_code == ERR_BAD_ATTR:
+        return String("Bad attribute length")
+    if err_code == ERR_BAD_BIGNUM:
+        return String("Bad bignum value")
+    if err_code == ERR_UNKNOWN_TYPE:
+        var msg = String("Protocol error, got ")
+        msg += _hex_byte(Int(err_byte))
+        msg += " as reply type byte"
+        return msg
+    return String()
 
 
 def _hex_byte(b: Int) -> String:
