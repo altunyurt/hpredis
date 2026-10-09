@@ -60,21 +60,21 @@ class Reader:
         self._feed = self._core.feed
         self._prefetch = self._core.prefetch_clean
         self._try_gets = self._core.try_gets
-        self._pending = []
-        self._pending_lengths = []
-        self._pending_index = 0
-        self._pending_count = 0
-        self._pending_bytes = 0
-        if not callable(protocolError if protocolError is not None else ProtocolError):
+        self._clear_pending()
+        protocol_error = protocolError if protocolError is not None else ProtocolError
+        reply_error = replyError if replyError is not None else ReplyError
+        if not callable(protocol_error):
             raise TypeError("protocolError must be callable")
-        if not callable(replyError if replyError is not None else ReplyError):
+        if not callable(reply_error):
             raise TypeError("replyError must be callable")
         if encoding is not None:
-            codecs.lookup(encoding)  # LookupError, matches hiredis
+            self._encoding_name = codecs.lookup(encoding).name  # LookupError
+        else:
+            self._encoding_name = None
         if errors is not None:
             codecs.lookup_error(errors)
-        self._protocolError = protocolError if protocolError is not None else ProtocolError
-        self._replyError = replyError if replyError is not None else ReplyError
+        self._protocolError = protocol_error
+        self._replyError = reply_error
         self._encoding = encoding
         self._errors = errors
         self._notEnoughData = notEnoughData
@@ -91,22 +91,19 @@ class Reader:
         # wasted core call per reply)
         self._special = False
         self._sync_decoding()
-        re = self._replyError
-        if isinstance(re, type):
+        if isinstance(reply_error, type):
             # classes are safe to cache strongly; a strong cache of a bound
             # method or closure would keep reader/callable cycles alive
-            self._reply_get = re
-            self._core.set_reply_error(re, False)
+            self._core.set_reply_error(reply_error, False)
         else:
-            if getattr(re, "__self__", None) is not None:
-                re_get = weakref.WeakMethod(re)
+            if getattr(reply_error, "__self__", None) is not None:
+                re_get = weakref.WeakMethod(reply_error)
             else:
                 try:
-                    re_get = weakref.ref(re)
+                    re_get = weakref.ref(reply_error)
                 except TypeError:
                     # callables without weakref support: strong proxy getter
-                    re_get = lambda: re
-            self._reply_get = re_get
+                    re_get = lambda: reply_error
             self._core.set_reply_error(re_get, True)
 
     def feed(self, data, start=None, stop=None):
@@ -142,10 +139,12 @@ class Reader:
         (redis-py's disable_decoding path calls gets(False))."""
         if self._highway:
             return self._highway_gets()
-        if self._exhausted and self._pending_index >= self._pending_count:
+        pending_index = self._pending_index
+        pending_count = self._pending_count
+        if self._exhausted and pending_index >= pending_count:
             return self._notEnoughData
         if (
-            self._pending_index >= self._pending_count
+            pending_index >= pending_count
             and self._encoding is None
             and not self._special
         ):
@@ -157,6 +156,7 @@ class Reader:
                 self._pending_count = len(self._pending)
                 self._pending_index = 0
                 self._pending_bytes = sum(self._pending_lengths)
+                pending_index, pending_count = 0, self._pending_count
             elif prefetched[0] == 1:
                 self._exhausted = True
                 return self._notEnoughData
@@ -167,17 +167,16 @@ class Reader:
                 return prefetched[1]
             else:
                 self._special = True
-        if self._pending_index < self._pending_count:
-            index = self._pending_index
-            reply = self._pending[index]
-            self._pending_index = index + 1
-            self._pending_bytes -= self._pending_lengths[index]
-            if self._pending_index == self._pending_count:
+        if pending_index < pending_count:
+            reply = self._pending[pending_index]
+            self._pending_index = pending_index + 1
+            self._pending_bytes -= self._pending_lengths[pending_index]
+            if pending_index + 1 == pending_count:
                 self._clear_pending()
             if self._encoding is not None and should_decode:
                 return self._finalize(reply, should_decode)
             return reply
-        result = self._try_gets(1 if should_decode else 0)
+        result = self._try_gets(should_decode)
         if type(result) is not tuple:
             self._special = False
             return result
@@ -232,11 +231,12 @@ class Reader:
             raise RuntimeError("drain() is not available in highway mode")
         if not isinstance(max_replies, int) or max_replies < 0:
             raise ValueError("max_replies must be a non-negative int")
-        pending_replies = self._pending[self._pending_index : self._pending_count]
-        if pending_replies:
+        pending_replies = []
+        if self._pending_index < self._pending_count:
+            pending_replies = self._pending[self._pending_index : self._pending_count]
             self._clear_pending()
         replies, proto_msg, dict_exc, had_markers, dec_failed, raise_exc = self._core.drain(
-            1 if should_decode else 0, max_replies
+            should_decode, max_replies
         )
         if dict_exc is not None:
             raise dict_exc
@@ -283,7 +283,9 @@ class Reader:
     def set_encoding(self, encoding=None, errors=None):
         """hiredis parity: change encoding/errors; validates eagerly."""
         if encoding is not None:
-            codecs.lookup(encoding)  # LookupError for unknown encodings
+            self._encoding_name = codecs.lookup(encoding).name  # LookupError
+        else:
+            self._encoding_name = None
         if errors is not None:
             codecs.lookup_error(errors)  # LookupError for unknown handlers
         self._encoding = encoding
@@ -348,7 +350,7 @@ class Reader:
             self._core.clear_decoding()
         else:
             self._dec_errors = self._errors if self._errors is not None else "strict"
-            name = codecs.lookup(self._encoding).name
+            name = self._encoding_name
             if name == "utf-8":
                 kind = 1
             elif name in ("latin-1", "iso8859-1"):

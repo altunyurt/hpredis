@@ -17,6 +17,18 @@ comptime TYPE_BULK = 36  # '$'
 comptime TYPE_SIMPLE = 43  # '+'
 comptime TYPE_ERROR = 45  # '-'
 comptime TYPE_INT = 58  # ':'
+comptime TYPE_PUSH = 62  # '>'
+comptime TYPE_ATTR = 124  # '|'
+comptime TYPE_SET = 126  # '~'
+comptime TYPE_MAP = 37  # '%'
+comptime TYPE_VERBATIM = 61  # '='
+comptime TYPE_BOOL = 35  # '#'
+comptime TYPE_NULL = 95  # '_'
+comptime TYPE_BIGNUM = 40  # '('
+comptime TYPE_DOUBLE = 44  # ','
+comptime CR = 13
+comptime LF = 10
+comptime COLON = 58
 
 # protocol-error codes: POD on Node/ScanResult; _err_text maps them to
 # hiredis' exact messages only when an error actually surfaces
@@ -142,6 +154,10 @@ struct Reader(Defaultable, Movable, Writable):
     var maxbuf: Int
     # one cached (ST_INCOMPLETE, None) tuple: polls must not allocate
     var incomplete_tuple: Int
+    # same caching for highway's (ST_INCOMPLETE, None, None)
+    var hw_incomplete_tuple: Int
+    # one owned Py_None reference reused for every nil reply
+    var none_obj: Int
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
     # ponytail: resume between top-level collection children; an incomplete
@@ -169,6 +185,8 @@ struct Reader(Defaultable, Movable, Writable):
         self.reply_error_weak = False
         self.maxbuf = 16384
         self.incomplete_tuple = 0
+        self.hw_incomplete_tuple = 0
+        self.none_obj = 0
         self.needs_scan = False
         self.scan_active = False
         self.scan_pos = 0
@@ -268,7 +286,8 @@ struct Reader(Defaultable, Movable, Writable):
             encoding=self_ptr[].dec_encoding,
             errors=self_ptr[].dec_errors,
             kind=self_ptr[].dec_kind,
-            failed=False)
+            failed=False,
+            none_obj=Reader._none_ptr(self_ptr))
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         if self_ptr[].needs_scan:
             # a previous chunk was incomplete: rebuild only once a scan says
@@ -276,7 +295,7 @@ struct Reader(Defaultable, Movable, Writable):
             # rebuilt from scratch on every chunk)
             if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
                 return Reader._incomplete_result(self_ptr)
-        if ptr.unsafe_offset(self_ptr[].consumed)[] == 45 and self_ptr[].reply_error != 0:
+        if ptr.unsafe_offset(self_ptr[].consumed)[] == TYPE_ERROR and self_ptr[].reply_error != 0:
             # top-level error replies are the hottest non-clean path: call the
             # replyError factory straight from C like hiredis does, instead of
             # building a marker tuple and a second status tuple
@@ -292,7 +311,7 @@ struct Reader(Defaultable, Movable, Writable):
             if inst != 0:
                 self_ptr[].consumed = crlf + 2
                 self_ptr[].needs_scan = False
-                _ = _compact(self_ptr[])
+                _compact(self_ptr[])
                 return PythonObject(from_owned=PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
                     unsafe_from_address=inst)))
             if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
@@ -305,7 +324,7 @@ struct Reader(Defaultable, Movable, Writable):
             var marker = _error_marker(ptr.unsafe_offset(msg_start), msg_len)
             self_ptr[].consumed = crlf + 2
             self_ptr[].needs_scan = False
-            _ = _compact(self_ptr[])
+            _compact(self_ptr[])
             return _status_tuple(ST_REPLY_ERR, marker)
         var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
         if node.status == ST_INCOMPLETE:
@@ -314,7 +333,7 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].needs_scan = False
         if node.status == ST_OK or node.status == ST_PUSH:
             self_ptr[].consumed = node.pos
-            _ = _compact(self_ptr[])
+            _compact(self_ptr[])
             if cnv.failed:
                 return _status_tuple(ST_DECODE_ERR, node.payload.steal_data())
             if node.status == ST_OK and node.had_err:
@@ -325,11 +344,11 @@ struct Reader(Defaultable, Movable, Writable):
         if node.status == ST_REPLY_ERR:
             # consumed (matches hiredis); wrapper builds the replyError instance
             self_ptr[].consumed = node.pos
-            _ = _compact(self_ptr[])
+            _compact(self_ptr[])
             return _status_tuple(ST_REPLY_ERR, node.payload.steal_data())
         if node.status == ST_DICT_ERR:
             self_ptr[].consumed = node.pos
-            _ = _compact(self_ptr[])
+            _compact(self_ptr[])
             return _status_tuple(ST_DICT_ERR, node.payload.steal_data())
         # protocol error: sticky, not consumed
         self_ptr[].proto_err = True
@@ -364,7 +383,8 @@ struct Reader(Defaultable, Movable, Writable):
             encoding=self_ptr[].dec_encoding,
             errors=self_ptr[].dec_errors,
             kind=self_ptr[].dec_kind,
-            failed=False)
+            failed=False,
+            none_obj=Reader._none_ptr(self_ptr))
         while reply_count < PREFETCH_MAX_REPLIES and batch_bytes < PREFETCH_MAX_BYTES:
             if self_ptr[].consumed >= self_ptr[].buf_len:
                 break
@@ -408,7 +428,7 @@ struct Reader(Defaultable, Movable, Writable):
                 # arrays/maps/sets parse here, because a clean one is exactly
                 # the object try_gets would return.  Marker cases (nested
                 # error/push) fall through to try_gets via the had_err check.
-                if t == 62:
+                if t == TYPE_PUSH:
                     special = True
                     break
                 var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
@@ -433,7 +453,7 @@ struct Reader(Defaultable, Movable, Writable):
                 lengths.append(cpy.PyLong_FromSsize_t(wire_len))
             reply_count += 1
             batch_bytes += wire_len
-        _ = _compact(self_ptr[])
+        _compact(self_ptr[])
         if reply_count == 0:
             if special:
                 return _status_tuple(ST_PREFETCH_SPECIAL, _none_payload())
@@ -455,6 +475,26 @@ struct Reader(Defaultable, Movable, Writable):
         return PythonObject(from_owned=t)
 
     @staticmethod
+    def _none_ptr(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) -> Int:
+        """Cache one owned Py_None reference per Reader (nil-heavy arrays)."""
+        if self_ptr[].none_obj == 0:
+            self_ptr[].none_obj = Int(_none_payload())
+        return self_ptr[].none_obj
+
+    @staticmethod
+    def _hw_incomplete_result(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+        """Return the cached (ST_INCOMPLETE, None, None) tuple; highway polls
+        must not allocate, like the classic path's _incomplete_result."""
+        if self_ptr[].hw_incomplete_tuple == 0:
+            self_ptr[].hw_incomplete_tuple = Int(
+                _hw_tuple(
+                    Python().cpython().PyLong_FromSsize_t(ST_INCOMPLETE),
+                    _none_payload(), _none_payload()).steal_data())
+        var t = _int_ptr(self_ptr[].hw_incomplete_tuple)
+        _ = Python().cpython().Py_IncRef(t)
+        return PythonObject(from_owned=t)
+
+    @staticmethod
     def dispose(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
         """Final release: buffers plus the cached Python references."""
         _ = Reader.free(self_ptr)
@@ -465,6 +505,12 @@ struct Reader(Defaultable, Movable, Writable):
         if self_ptr[].incomplete_tuple != 0:
             _ = cpy.Py_DecRef(_int_ptr(self_ptr[].incomplete_tuple))
             self_ptr[].incomplete_tuple = 0
+        if self_ptr[].hw_incomplete_tuple != 0:
+            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].hw_incomplete_tuple))
+            self_ptr[].hw_incomplete_tuple = 0
+        if self_ptr[].none_obj != 0:
+            _ = cpy.Py_DecRef(_int_ptr(self_ptr[].none_obj))
+            self_ptr[].none_obj = 0
         return PythonObject(0)
 
     @staticmethod
@@ -484,9 +530,6 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].scan_active = False
         self_ptr[].scan_pos = 0
         self_ptr[].scan_remaining = 0
-        if self_ptr[].reply_error != 0:
-            _ = Python().cpython().Py_DecRef(_int_ptr(self_ptr[].reply_error))
-            self_ptr[].reply_error = 0
         return PythonObject(0)
 
     @staticmethod
@@ -510,7 +553,8 @@ struct Reader(Defaultable, Movable, Writable):
             encoding=self_ptr[].dec_encoding,
             errors=self_ptr[].dec_errors,
             kind=self_ptr[].dec_kind,
-            failed=False)
+            failed=False,
+            none_obj=Reader._none_ptr(self_ptr))
         if self_ptr[].proto_err:
             return _drain_result(
                 _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), _none_payload(),
@@ -526,6 +570,35 @@ struct Reader(Defaultable, Movable, Writable):
                 if self_ptr[].needs_scan:
                     if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
                         break
+                var epos = self_ptr[].consumed
+                if ptr.unsafe_offset(epos)[] == TYPE_ERROR and re_ptr != 0:
+                    # top-level error: call the factory directly like try_gets
+                    # instead of building a marker tuple this loop undoes
+                    var ecrlf = _find_crlf(ptr, epos + 1, self_ptr[].buf_len)
+                    if ecrlf < 0:
+                        self_ptr[].needs_scan = True
+                        break
+                    var einst = _error_to_instance(
+                        re_ptr, self_ptr[].reply_error_weak,
+                        ptr.unsafe_offset(epos + 1), ecrlf - (epos + 1))
+                    if einst != 0:
+                        self_ptr[].consumed = ecrlf + 2
+                        self_ptr[].needs_scan = False
+                        collected.append(PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+                            unsafe_from_address=einst)))
+                        continue
+                    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+                        var eraised = external_call["PyErr_GetRaisedException", PyObjectPtr]()
+                        if len(collected) > 0:
+                            # deliver what parsed; the next drain()/gets() raises
+                            _ = external_call["Py_DecRef", NoneType](
+                                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(eraised)))
+                            break
+                        self_ptr[].consumed = ecrlf + 2
+                        self_ptr[].needs_scan = False
+                        raise_exc = eraised
+                        break
+                    # dead weakref: fall through to the marker build below
                 var node = _parse_node(ptr, self_ptr[].consumed, self_ptr[].buf_len, 1, cnv)
                 if node.status == ST_INCOMPLETE:
                     self_ptr[].needs_scan = True
@@ -537,7 +610,7 @@ struct Reader(Defaultable, Movable, Writable):
                         break
                     # unhashable map key: consumed; the wrapper raises TypeError
                     self_ptr[].consumed = node.pos
-                    _ = _compact(self_ptr[])
+                    _compact(self_ptr[])
                     return _drain_result(
                         _list_of(collected), _none_payload(), node.payload.steal_data(),
                         False, cnv.failed, _none_payload())
@@ -548,7 +621,7 @@ struct Reader(Defaultable, Movable, Writable):
                     # sticky and not consumed (matches gets)
                     self_ptr[].proto_err = True
                     self_ptr[].proto_err_msg = _err_text(node.err_code, node.err_byte)
-                    _ = _compact(self_ptr[])
+                    _compact(self_ptr[])
                     return _drain_result(
                         _list_of(collected), _bytes_payload(self_ptr[].proto_err_msg), _none_payload(),
                         False, cnv.failed, _none_payload())
@@ -602,7 +675,7 @@ struct Reader(Defaultable, Movable, Writable):
                 else:
                     collected.append(node.payload.steal_data())
             # compact once for the whole batch (gets compacts per reply)
-            _ = _compact(self_ptr[])
+            _compact(self_ptr[])
             return _drain_result(
                 _list_of(collected), _none_payload(), _none_payload(), had_markers,
                 cnv.failed, raise_exc)
@@ -630,13 +703,13 @@ struct Reader(Defaultable, Movable, Writable):
         """
         ref cpy = Python().cpython()
         if self_ptr[].consumed >= self_ptr[].buf_len:
-            return _hw_tuple(cpy.PyLong_FromSsize_t(ST_INCOMPLETE), _none_payload(), _none_payload())
+            return Reader._hw_incomplete_result(self_ptr)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         var start = self_ptr[].consumed
         self_ptr[].highway_slices.clear()
         var res = _scan_highway(ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start, 1)
         if res.status == ST_INCOMPLETE:
-            return _hw_tuple(cpy.PyLong_FromSsize_t(ST_INCOMPLETE), _none_payload(), _none_payload())
+            return Reader._hw_incomplete_result(self_ptr)
         if res.status == ST_PROTO_ERR:
             self_ptr[].proto_err = True
             self_ptr[].proto_err_msg = _err_text(res.err_code, res.err_byte)
@@ -795,10 +868,10 @@ def _ensure_cap(mut r: Reader, needed: Int) raises:
     r.buf_addr = Int(_arena_ptr(r.buf_obj))
 
 
-def _compact(mut r: Reader) -> Bool:
-    """Returns True if a memmove compaction happened."""
+def _compact(mut r: Reader):
+    """Drop consumed bytes once they dominate the buffer."""
     if r.consumed == 0:
-        return False
+        return
     if r.consumed == r.buf_len:
         r.buf_len = 0
         r.consumed = 0
@@ -815,7 +888,7 @@ def _compact(mut r: Reader) -> Bool:
                 r.buf_addr = Int(_arena_ptr(r.buf_obj))
             else:
                 _ = Python().cpython().PyErr_Clear()
-        return False
+        return
     if r.consumed * 2 >= r.buf_len and r.buf_len > 1024:
         var dst = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr)
         var src = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr + r.consumed)
@@ -825,8 +898,6 @@ def _compact(mut r: Reader) -> Bool:
             r.scan_pos -= r.consumed
         r.buf_len -= r.consumed
         r.consumed = 0
-        return True
-    return False
 
 
 # === Result helpers ===
@@ -860,13 +931,23 @@ struct DecodeCtx(ImplicitlyCopyable):
     var errors: Int
     var kind: UInt8
     var failed: Bool
+    # Reader._none_ptr: nil replies reuse it instead of rebuilding Py_None
+    var none_obj: Int
 
-    def __init__(out self, enabled: Bool, encoding: Int, errors: Int, kind: UInt8, failed: Bool):
+    def __init__(out self, enabled: Bool, encoding: Int, errors: Int, kind: UInt8, failed: Bool, none_obj: Int):
         self.enabled = enabled
         self.encoding = encoding
         self.errors = errors
         self.kind = kind
         self.failed = failed
+        self.none_obj = none_obj
+
+
+def _cached_none(cnv: DecodeCtx) -> PyObjectPtr:
+    """Owned Py_None reference from the Reader's single cached object."""
+    var p = _int_ptr(cnv.none_obj)
+    _ = Python().cpython().Py_IncRef(p)
+    return p
 
 
 def _leaf_payload(
@@ -1122,13 +1203,18 @@ def _is_inf_or_nan(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> 
     return a == 110 and b == 97 and c == 110  # nan
 
 
+def _skip_minus(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Int:
+    """Index after an optional leading '-' (hiredis' prefix rule)."""
+    if start < crlf and ptr.unsafe_offset(start)[] == 45:  # '-'
+        return start + 1
+    return start
+
+
 def _double_chars_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
     """hiredis' double grammar: optional '-', then digits/'.'/exponent
     characters, or exactly inf/nan.  Leading '+', hex floats and underscores
     are rejected before strtod runs (verified against hiredis 3.4.2)."""
-    var i = start
-    if i < crlf and ptr.unsafe_offset(i)[] == 45:  # '-'
-        i += 1
+    var i = _skip_minus(ptr, start, crlf)
     if i >= crlf:
         return False
     if _is_inf_or_nan(ptr, i, crlf):
@@ -1171,9 +1257,7 @@ def _double_parse(
 
 def _bignum_ok(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int) -> Bool:
     """hiredis accepts an optional '-' followed by at least one digit."""
-    var i = start
-    if i < crlf and ptr.unsafe_offset(i)[] == 45:  # '-'
-        i += 1
+    var i = _skip_minus(ptr, start, crlf)
     if i >= crlf:
         return False
     while i < crlf:
@@ -1193,7 +1277,7 @@ def _find_crlf(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int) -> Int:
         if Int(hit) == 0:
             return -1
         var pos = Int(hit) - Int(ptr)
-        if pos + 1 < end and ptr.unsafe_offset(pos + 1)[] == 10:
+        if pos + 1 < end and ptr.unsafe_offset(pos + 1)[] == LF:
             return pos
         p = ptr.unsafe_offset(pos + 1)
         remaining = end - (pos + 1)
@@ -1228,10 +1312,10 @@ def _read_len_fast(
             var i = start + 1
             while i < end:
                 var d = Int(ptr.unsafe_offset(i)[])
-                if d == 13:
+                if d == CR:
                     if i + 1 >= end:
                         break
-                    if ptr.unsafe_offset(i + 1)[] != 10:
+                    if ptr.unsafe_offset(i + 1)[] != LF:
                         break
                     out_end = i + 2
                     status = ST_OK
@@ -1265,10 +1349,10 @@ def _parse_int_line(
     var line_len = crlf - start
     var i = start
     var neg = False
-    if line_len > 0 and ptr.unsafe_offset(i)[] == 45:  # '-'
+    if ptr.unsafe_offset(i)[] == 45:  # '-'
         neg = True
         i += 1
-    if i >= start + line_len:
+    if i >= crlf:
         status = ST_PROTO_ERR  # only a negative sign
         return 0
     var first = Int(ptr.unsafe_offset(i)[])
@@ -1284,7 +1368,7 @@ def _parse_int_line(
         return 0
     var value = UInt64(first - 48)
     i += 1
-    while i < start + line_len:
+    while i < crlf:
         var c = Int(ptr.unsafe_offset(i)[])
         if not (48 <= c <= 57):
             status = ST_PROTO_ERR
@@ -1323,7 +1407,7 @@ def _proto_node_byte(pos: Int, err_code: UInt8, err_byte: UInt8) raises -> Node:
 
 
 def _incomplete_node(pos: Int) raises -> Node:
-    return Node(ST_INCOMPLETE, pos, PythonObject(from_owned=_bytes_payload(String())))
+    return Node(ST_INCOMPLETE, pos, PythonObject(from_owned=_none_payload()))
 
 
 # hiredis caps nesting at 1024 containers and reports this exact message
@@ -1367,7 +1451,7 @@ def _scan_resp[HIGHWAY: Bool](
     if start >= end:
         return ScanResult(ST_INCOMPLETE, start)
     var t = ptr.unsafe_offset(start)[]
-    if t == TYPE_SIMPLE or t == TYPE_ERROR or t == TYPE_INT or t == 44:
+    if t == TYPE_SIMPLE or t == TYPE_ERROR or t == TYPE_INT or t == TYPE_DOUBLE:
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return ScanResult(ST_INCOMPLETE, start)
@@ -1379,7 +1463,7 @@ def _scan_resp[HIGHWAY: Bool](
             _ = _parse_int_line(ptr, start + 1, crlf, after_crlf, status)
             if status == ST_PROTO_ERR:
                 return ScanResult(ST_PROTO_ERR, start, ERR_BAD_INT, 0)
-        elif t == 44:
+        elif t == TYPE_DOUBLE:
             var dval: Float64 = 0.0
             var derr = _double_parse(ptr, start + 1, crlf, dval)
             if derr != ERR_NONE:
@@ -1407,7 +1491,7 @@ def _scan_resp[HIGHWAY: Bool](
         if HIGHWAY:
             _record_slice(slices, pstart - base, blen, TYPE_BULK)
         return ScanResult(ST_OK, pstart + blen + 2)
-    if t == 40:  # '(' big number
+    if t == TYPE_BIGNUM:  # '(' big number
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return ScanResult(ST_INCOMPLETE, start)
@@ -1416,7 +1500,7 @@ def _scan_resp[HIGHWAY: Bool](
         if HIGHWAY:
             _record_slice(slices, start + 1 - base, crlf - (start + 1), t)
         return ScanResult(ST_OK, crlf + 2)
-    if t == TYPE_ARRAY or t == 62 or t == 124:  # '*' / '>' push / '|' attribute
+    if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_ATTR:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
@@ -1426,7 +1510,7 @@ def _scan_resp[HIGHWAY: Bool](
             return ScanResult(ST_PROTO_ERR, start, ERR_BAD_MULTI_LEN, 0)
         if count > MAX_CONTAINER_ELEMENTS:
             return ScanResult(ST_PROTO_ERR, start, ERR_MULTI_RANGE, 0)
-        if t == 124:
+        if t == TYPE_ATTR:
             if count < 0:
                 return ScanResult(ST_PROTO_ERR, start, ERR_BAD_ATTR, 0)
             count *= 2
@@ -1451,7 +1535,7 @@ def _scan_resp[HIGHWAY: Bool](
                 return ScanResult(ST_INCOMPLETE, start)
             pos = child.pos
         return ScanResult(ST_OK, pos)
-    if t == 126:  # '~' set
+    if t == TYPE_SET:  # '~' set
         var after_int2 = start + 1
         var status2: UInt8 = ST_OK
         var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
@@ -1466,7 +1550,7 @@ def _scan_resp[HIGHWAY: Bool](
         if count2 > (end - after_int2) // 3:
             return ScanResult(ST_INCOMPLETE, start)
         if HIGHWAY:
-            _record_slice(slices, start - base, count2, 126)  # set header
+            _record_slice(slices, start - base, count2, t)  # set header
         var spos = after_int2
         for _i2 in range(count2):
             var child2 = _scan_resp[HIGHWAY](ptr, spos, end, slices, base, depth + 1)
@@ -1476,7 +1560,7 @@ def _scan_resp[HIGHWAY: Bool](
                 return ScanResult(ST_INCOMPLETE, start)
             spos = child2.pos
         return ScanResult(ST_OK, spos)
-    if t == 37:  # '%' map
+    if t == TYPE_MAP:  # '%' map
         var after_int3 = start + 1
         var status3: UInt8 = ST_OK
         var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
@@ -1491,7 +1575,7 @@ def _scan_resp[HIGHWAY: Bool](
         if pairs > (end - after_int3) // 6:
             return ScanResult(ST_INCOMPLETE, start)
         if HIGHWAY:
-            _record_slice(slices, start - base, pairs * 2, 37)  # map header
+            _record_slice(slices, start - base, pairs * 2, t)  # map header
         var mpos = after_int3
         for _i3 in range(pairs):
             var key_node = _scan_resp[HIGHWAY](ptr, mpos, end, slices, base, depth + 1)
@@ -1507,7 +1591,7 @@ def _scan_resp[HIGHWAY: Bool](
                 return ScanResult(ST_INCOMPLETE, start)
             mpos = val_node.pos
         return ScanResult(ST_OK, mpos)
-    if t == 61:  # '=' verbatim: skip the "txt:" prefix like the classic path
+    if t == TYPE_VERBATIM:  # '=' verbatim: skip the "txt:" prefix like the classic path
         var after_int4 = start + 1
         var status4: UInt8 = ST_OK
         var vlen = _read_int(ptr, start + 1, end, after_int4, status4)
@@ -1526,12 +1610,12 @@ def _scan_resp[HIGHWAY: Bool](
             return ScanResult(ST_INCOMPLETE, start)
         if vlen < 4:
             return ScanResult(ST_PROTO_ERR, start, ERR_VERBATIM_FORMAT, 0)
-        if ptr.unsafe_offset(pstart4 + 3)[] != 58:  # ':'
+        if ptr.unsafe_offset(pstart4 + 3)[] != COLON:  # ':'
             return ScanResult(ST_PROTO_ERR, start, ERR_VERBATIM_FORMAT, 0)
         if HIGHWAY:
             _record_slice(slices, pstart4 + 4 - base, vlen - 4, t)
         return ScanResult(ST_OK, pstart4 + vlen + 2)
-    if t == 35:  # '#' bool
+    if t == TYPE_BOOL:  # '#' bool
         if start + 2 > end:
             return ScanResult(ST_INCOMPLETE, start)
         var bval = ptr.unsafe_offset(start + 1)[]
@@ -1539,18 +1623,18 @@ def _scan_resp[HIGHWAY: Bool](
             return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BOOL, 0)
         if start + 4 > end:
             return ScanResult(ST_INCOMPLETE, start)
-        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
+        if ptr.unsafe_offset(start + 2)[] != CR or ptr.unsafe_offset(start + 3)[] != LF:
             return ScanResult(ST_PROTO_ERR, start, ERR_BAD_BOOL, 0)
         if HIGHWAY:
-            _record_slice(slices, start + 1 - base, 1, 35)  # 't'/'f' byte
+            _record_slice(slices, start + 1 - base, 1, t)  # 't'/'f' byte
         return ScanResult(ST_OK, start + 4)
-    if t == 95:  # '_' null
+    if t == TYPE_NULL:  # '_' null
         if start + 3 > end:
             return ScanResult(ST_INCOMPLETE, start)
-        if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
+        if ptr.unsafe_offset(start + 1)[] != CR or ptr.unsafe_offset(start + 2)[] != LF:
             return ScanResult(ST_PROTO_ERR, start, ERR_BAD_NULL, 0)
         if HIGHWAY:
-            _record_slice(slices, start - base, -1, 95)  # null row
+            _record_slice(slices, start - base, -1, t)  # null row
         return ScanResult(ST_OK, start + 3)
     # unknown type byte: the dynamic byte is kept for _err_text
     return ScanResult(ST_PROTO_ERR, start, ERR_UNKNOWN_TYPE, t)
@@ -1601,11 +1685,9 @@ def _scan_resume(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
 
 def _scan_needs(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     """Scan the pending reply when a previous build came back incomplete."""
-    if r.consumed >= r.buf_len:
-        return ST_INCOMPLETE
     var t = ptr.unsafe_offset(r.consumed)[]
     var status: UInt8 = ST_OK
-    if t == TYPE_ARRAY or t == 62:
+    if t == TYPE_ARRAY or t == TYPE_PUSH:
         status = _scan_resume(r, ptr)
     else:
         var sc = _scan_node(ptr, r.consumed, r.buf_len, 1)
@@ -1633,8 +1715,6 @@ def _parse_node(
             var after_crlf = crlf
             var status: UInt8 = ST_OK
             var value = _parse_int_line(ptr, pstart, crlf, after_crlf, status)
-            if status == ST_INCOMPLETE:
-                return _incomplete_node(start)
             if status == ST_PROTO_ERR:
                 return _proto_node(start, ERR_BAD_INT)
             ref cpy = Python().cpython()
@@ -1656,21 +1736,21 @@ def _parse_node(
         if blen < -1:
             return _proto_node(start, ERR_BULK_RANGE)
         if blen == -1:
-            return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
+            return Node(ST_OK, after_int, PythonObject(from_owned=_cached_none(cnv)))
         var pstart = after_int
         if blen > end - pstart - 2:  # no overflow for blen near Int.MAX
             return _incomplete_node(start)
         # hiredis does not validate the trailing CRLF after a bulk payload;
         # it consumes payload + 2 bytes unconditionally (verified 3.4.2)
         return Node(ST_OK, pstart + blen + 2, PythonObject(from_owned=_leaf_payload(ptr, pstart, blen, cnv)))
-    if t == 40:  # '(' big number: digits until CRLF, returned as bytes
+    if t == TYPE_BIGNUM:  # '(' big number: digits until CRLF, returned as bytes
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return _incomplete_node(start)
         if not _bignum_ok(ptr, start + 1, crlf):
             return _proto_node(start, ERR_BAD_BIGNUM)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=_leaf_payload(ptr, start + 1, crlf - (start + 1), cnv)))
-    if t == TYPE_ARRAY or t == 62 or t == 124:  # '*' / '>' push / '|' attribute
+    if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_ATTR:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var count = _read_int(ptr, start + 1, end, after_int, status)
@@ -1680,7 +1760,7 @@ def _parse_node(
             return _proto_node(start, ERR_BAD_MULTI_LEN)
         if count > MAX_CONTAINER_ELEMENTS:
             return _proto_node(start, ERR_MULTI_RANGE)
-        if t == 124:
+        if t == TYPE_ATTR:
             # attributes flatten N key/value pairs into one list (hiredis-py)
             if count < 0:
                 return _proto_node(start, ERR_BAD_ATTR)
@@ -1688,7 +1768,7 @@ def _parse_node(
         elif count < -1:
             return _proto_node(start, ERR_MULTI_RANGE)
         elif count == -1:
-            return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
+            return Node(ST_OK, after_int, PythonObject(from_owned=_cached_none(cnv)))
         if depth > MAX_DEPTH:
             return _proto_node(start, ERR_MAX_DEPTH)
         if count > (end - after_int) // 3:
@@ -1722,7 +1802,7 @@ def _parse_node(
                     _ = cpy.Py_DecRef(list_obj)
                     return _proto_node(start, ERR_BULK_RANGE)
                 if blen2 == -1:
-                    _ = cpy.PyList_SetItem(list_obj, i, _none_payload())
+                    _ = cpy.PyList_SetItem(list_obj, i, _cached_none(cnv))
                     pos = after2
                 else:
                     if after2 + blen2 + 2 > end:
@@ -1789,11 +1869,11 @@ def _parse_node(
             else:
                 _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
             pos = child.pos
-        var out_status: UInt8 = ST_PUSH if t == 62 else ST_OK
+        var out_status: UInt8 = ST_PUSH if t == TYPE_PUSH else ST_OK
         var out_node = Node(out_status, pos, PythonObject(from_owned=list_obj))
         out_node.had_err = saw_err
         return out_node^
-    if t == 44:  # ',' double
+    if t == TYPE_DOUBLE:  # ',' double
         var crlf = _find_crlf(ptr, start + 1, end)
         if crlf < 0:
             return _incomplete_node(start)
@@ -1802,7 +1882,7 @@ def _parse_node(
         if derr != ERR_NONE:
             return _proto_node(start, derr)
         return Node(ST_OK, crlf + 2, PythonObject(from_owned=Python().cpython().PyFloat_FromDouble(dval)))
-    if t == 35:  # '#' bool: #t\r\n / #f\r\n
+    if t == TYPE_BOOL:  # '#' bool: #t\r\n / #f\r\n
         if start + 2 > end:
             return _incomplete_node(start)
         var bval = ptr.unsafe_offset(start + 1)[]
@@ -1810,19 +1890,19 @@ def _parse_node(
             return _proto_node(start, ERR_BAD_BOOL)
         if start + 4 > end:
             return _incomplete_node(start)
-        if ptr.unsafe_offset(start + 2)[] != 13 or ptr.unsafe_offset(start + 3)[] != 10:
+        if ptr.unsafe_offset(start + 2)[] != CR or ptr.unsafe_offset(start + 3)[] != LF:
             return _proto_node(start, ERR_BAD_BOOL)
         ref cpy2 = Python().cpython()
         if bval == 116 or bval == 84:
             return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(1)))
         return Node(ST_OK, start + 4, PythonObject(from_owned=cpy2.PyBool_FromLong(0)))
-    if t == 95:  # '_' null
+    if t == TYPE_NULL:  # '_' null
         if start + 3 > end:
             return _incomplete_node(start)
-        if ptr.unsafe_offset(start + 1)[] != 13 or ptr.unsafe_offset(start + 2)[] != 10:
+        if ptr.unsafe_offset(start + 1)[] != CR or ptr.unsafe_offset(start + 2)[] != LF:
             return _proto_node(start, ERR_BAD_NULL)
-        return Node(ST_OK, start + 3, PythonObject(from_owned=_none_payload()))
-    if t == 61:  # '=' verbatim string
+        return Node(ST_OK, start + 3, PythonObject(from_owned=_cached_none(cnv)))
+    if t == TYPE_VERBATIM:  # '=' verbatim string
         var after_int = start + 1
         var status: UInt8 = ST_OK
         var vlen = _read_int(ptr, start + 1, end, after_int, status)
@@ -1835,7 +1915,7 @@ def _parse_node(
         if vlen < -1:
             return _proto_node(start, ERR_BULK_RANGE)
         if vlen == -1:
-            return Node(ST_OK, after_int, PythonObject(from_owned=_none_payload()))
+            return Node(ST_OK, after_int, PythonObject(from_owned=_cached_none(cnv)))
         var pstart = after_int
         if vlen > end - pstart - 2:
             return _incomplete_node(start)
@@ -1843,10 +1923,10 @@ def _parse_node(
         # value is what follows it (verified 3.4.2)
         if vlen < 4:
             return _proto_node(start, ERR_VERBATIM_FORMAT)
-        if ptr.unsafe_offset(pstart + 3)[] != 58:  # ':'
+        if ptr.unsafe_offset(pstart + 3)[] != COLON:  # ':'
             return _proto_node(start, ERR_VERBATIM_FORMAT)
         return Node(ST_OK, pstart + vlen + 2, PythonObject(from_owned=_leaf_payload(ptr, pstart + 4, vlen - 4, cnv)))
-    if t == 126:  # '~' set -> plain list (hiredis-py parity)
+    if t == TYPE_SET:  # '~' set -> plain list (hiredis-py parity)
         var after_int2 = start + 1
         var status2: UInt8 = ST_OK
         var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
@@ -1886,7 +1966,7 @@ def _parse_node(
         var set_node = Node(ST_OK, spos, PythonObject(from_owned=set_list))
         set_node.had_err = saw_err2
         return set_node^
-    if t == 37:  # '%' map -> dict (N key/value pairs)
+    if t == TYPE_MAP:  # '%' map -> dict (N key/value pairs)
         var after_int3 = start + 1
         var status3: UInt8 = ST_OK
         var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
@@ -1946,7 +2026,7 @@ def _parse_node(
                 var dict_exc = external_call["PyErr_GetRaisedException", PyObjectPtr]()
                 _ = cpy4.Py_DecRef(dict_obj)
                 if Int(dict_exc) == 0:
-                    return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=_none_payload()))
+                    return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=_cached_none(cnv)))
                 return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=dict_exc))
         var map_node = Node(ST_OK, mpos, PythonObject(from_owned=dict_obj))
         map_node.had_err = saw_err3

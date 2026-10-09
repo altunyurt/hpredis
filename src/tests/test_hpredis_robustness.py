@@ -792,3 +792,62 @@ def test_drain_still_converts_nested_markers():
     replies = r.drain()
     assert isinstance(replies[0][1], hpredis.ReplyError)
     assert replies[0][1].args[0] == "ERR nested"
+
+
+# --- cached refs and factory lifetime ---------------------------------------
+
+
+def test_array_nil_elements_are_none():
+    r = reader()
+    r.feed(b"*3\r\n$-1\r\n_\r\n$1\r\nx\r\n")
+    assert r.gets() == [None, None, b"x"]
+
+
+def test_close_then_feed_keeps_the_reply_error_factory():
+    class Boom(Exception):
+        pass
+
+    calls = []
+
+    def factory(message):
+        calls.append(message)
+        return Boom(message)
+
+    r = hpredis.Reader(replyError=factory)
+    r.feed(b"-ERR one\r\n")
+    assert isinstance(r.gets(), Boom)
+    r.close()
+    r.feed(b"-ERR two\r\n")
+    assert isinstance(r.gets(), Boom)
+    assert calls == ["ERR one", "ERR two"]
+
+
+def test_drain_error_replies_call_the_factory_once_each():
+    class Boom(Exception):
+        pass
+
+    calls = []
+
+    def factory(message):
+        calls.append(message)
+        return Boom(message)
+
+    r = hpredis.Reader(replyError=factory)
+    r.feed(b"-ERR one\r\n+OK\r\n-ERR two\r\n")
+    replies = r.drain(False)
+    assert [type(x) for x in replies] == [Boom, bytes, Boom]
+    assert calls == ["ERR one", "ERR two"]
+
+
+def test_drain_raising_factory_delivers_prior_replies_then_raises():
+    class Boom(Exception):
+        pass
+
+    def factory(message):
+        raise Boom(message)
+
+    r = hpredis.Reader(replyError=factory)
+    r.feed(b"+OK\r\n-ERR x\r\n")
+    assert r.drain(False) == [b"OK"]
+    with pytest.raises(Boom, match="ERR x"):
+        r.drain(False)
