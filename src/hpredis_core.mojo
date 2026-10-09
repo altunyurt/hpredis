@@ -706,9 +706,19 @@ struct Reader(Defaultable, Movable, Writable):
             return Reader._hw_incomplete_result(self_ptr)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         var start = self_ptr[].consumed
+        if self_ptr[].needs_scan:
+            # a previous attempt was incomplete: the classic resumable scan
+            # decides completeness at child boundaries, so a chunked reply no
+            # longer rewrites the whole table per feed.  Slices are recorded
+            # once, by the full walk below, after the reply is complete.
+            if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
+                return Reader._hw_incomplete_result(self_ptr)
+            self_ptr[].needs_scan = False
         self_ptr[].highway_slices.clear()
         var res = _scan_highway(ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start, 1)
         if res.status == ST_INCOMPLETE:
+            self_ptr[].needs_scan = True
+            self_ptr[].highway_slices.clear()
             return Reader._hw_incomplete_result(self_ptr)
         if res.status == ST_PROTO_ERR:
             self_ptr[].proto_err = True

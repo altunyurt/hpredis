@@ -173,6 +173,43 @@ def test_highway_rejects_malformed_int_and_double(payload):
         r.gets()
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+        b"%2\r\n$1\r\nk\r\n:1\r\n$1\r\nv\r\n$1\r\nw\r\n",
+        b"*2\r\n*2\r\n$1\r\na\r\n:1\r\n$1\r\nb\r\n",
+        b"*4\r\n$4\r\ndata\r\n$-1\r\n#t\r\n,1.5\r\n",
+        b"*2\r\n$3\r\nfoo\r\n*2\r\n$1\r\nx\r\n=8\r\ntxt:abcd\r\n",
+    ],
+)
+def test_highway_chunked_matches_single_feed(payload):
+    one = hpredis.Reader(highway_mode=True)
+    one.feed(payload)
+    want, want_arena = one.gets()
+    for chunk in (1, 3, 7, 4096):
+        r = hpredis.Reader(highway_mode=True)
+        got = False
+        for off in range(0, len(payload), chunk):
+            r.feed(payload[off : off + chunk])
+            got = r.gets()
+            if got is not False:
+                break
+        assert got is not False, chunk
+        table, arena = got
+        assert bytes(table) == bytes(want), chunk
+
+
+def test_highway_chunked_protocol_error_matches_single_feed():
+    payload = b"*2\r\n$1\r\na\r\n?bad\r\n"
+    r = hpredis.Reader(highway_mode=True)
+    with pytest.raises(hpredis.ProtocolError):
+        for off in range(0, len(payload), 3):
+            r.feed(payload[off : off + 3])
+            if r.gets() is not False:
+                break
+
+
 def test_highway_verbatim_slice_nil_and_format_error():
     r = hpredis.Reader(highway_mode=True)
     r.feed(b"=8\r\ntxt:abcd\r\n")
