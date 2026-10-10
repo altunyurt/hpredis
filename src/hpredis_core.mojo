@@ -252,8 +252,30 @@ struct Reader(Defaultable, Movable, Writable):
     def set_maxbuf(
         self_ptr: Pointer[mut=True, Self, MutAnyOrigin], value: PythonObject
     ) raises -> PythonObject:
-        """Store maxbuf (the wrapper validates it); 0 disables trimming."""
-        self_ptr[].maxbuf = Int(py=value)
+        """Store maxbuf (the wrapper validates it); 0 disables trimming.
+
+        An idle arena larger than the new value is released here, so callers
+        can hand memory back on demand.  The shrink is deliberately NOT done
+        per reply: freeing a consumed arena forces a full re-grow (page
+        faults plus copies) on the next feed, which measured 2.4x slower on
+        bulk arrays (1.36M page faults vs 4.6k, findings/6).
+        """
+        var mb = Int(py=value)
+        self_ptr[].maxbuf = mb
+        if (
+            mb > 0
+            and self_ptr[].buf_len == 0
+            and self_ptr[].buf_cap > mb
+            and not _arena_pinned(self_ptr[])
+        ):
+            var rc = external_call["PyByteArray_Resize", c_int](
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_obj),
+                c_ssize_t(mb))
+            if rc == 0:
+                self_ptr[].buf_cap = mb
+                self_ptr[].buf_addr = Int(_arena_ptr(self_ptr[].buf_obj))
+            else:
+                _pyerr_clear()
         return PythonObject(0)
 
     @staticmethod
@@ -817,16 +839,11 @@ def _compact(mut r: Reader):
         r.buf_len = 0
         r.consumed = 0
         r.scan_frames.clear()
-        # released an oversized arena instead of pinning it for the life of
-        # the reader (hiredis trims an empty buffer's free space above maxbuf)
-        if r.maxbuf > 0 and r.buf_cap > r.maxbuf and not _arena_pinned(r):
-            var rc = external_call["PyByteArray_Resize", c_int](
-                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_obj), c_ssize_t(r.maxbuf))
-            if rc == 0:
-                r.buf_cap = r.maxbuf
-                r.buf_addr = Int(_arena_ptr(r.buf_obj))
-            else:
-                _pyerr_clear()
+        # Capacity is kept, not shrunk to maxbuf: an idle shrink makes the
+        # next feed re-grow from 16 KiB to the high-water mark, and that
+        # churn (page faults plus repeated reallocs) cost 2.4x on a bulk-array
+        # loop while executing the same number of instructions (findings/6).
+        # set_maxbuf() releases an oversized idle arena on demand instead.
         return
     if r.consumed * 2 >= r.buf_len and r.buf_len > 1024:
         var dst = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr)
@@ -862,6 +879,25 @@ def _decref(p: PyObjectPtr):
 
 def _pyerr_clear():
     _ = external_call["PyErr_Clear", NoneType]()
+
+
+def _list_new(n: Int) -> PyObjectPtr:
+    # external_call, not the cpython binding object: Python().cpython() runs a
+    # GIL check plus a runtime global lookup, and the container branches call
+    # it once per level (measured ~21% of a 50-deep nested reply, findings/6).
+    return external_call["PyList_New", PyObjectPtr](c_ssize_t(n))
+
+
+def _list_set(lst: PyObjectPtr, i: Int, value: PyObjectPtr):
+    _ = external_call["PyList_SetItem", c_int](lst, c_ssize_t(i), value)
+
+
+def _dict_new() -> PyObjectPtr:
+    return external_call["PyDict_New", PyObjectPtr]()
+
+
+def _dict_set(d: PyObjectPtr, key: PyObjectPtr, value: PyObjectPtr) -> c_int:
+    return external_call["PyDict_SetItem", c_int](d, key, value)
 
 
 def _tuple_new(size: Int) -> PyObjectPtr:
@@ -1010,10 +1046,9 @@ def _list_of(imm collected: List[PyObjectPtr]) raises -> PyObjectPtr:
     PyList_SetItem is cheap, while external_call marshalling per reply costs
     ~0.3ns per payload byte (measured).
     """
-    ref cpy = Python().cpython()
-    var lst = cpy.PyList_New(len(collected))
+    var lst = _list_new(len(collected))
     for i in range(len(collected)):
-        _ = cpy.PyList_SetItem(lst, i, collected[i])
+        _ = _list_set(lst, i, collected[i])
     return lst
 
 
@@ -1809,8 +1844,7 @@ def _parse_node(
         if count > (end - after_int) // 3:
             # fewer than 3 bytes per element left: this reply can never complete
             return _incomplete_node(start)
-        ref cpy = Python().cpython()
-        var list_obj = cpy.PyList_New(count)
+        var list_obj = _list_new(count)
         var pos = after_int
         var saw_err = False
         for i in range(count):
@@ -1837,7 +1871,7 @@ def _parse_node(
                     _ = _decref(list_obj)
                     return _proto_node(start, ERR_BULK_RANGE)
                 if blen2 == -1:
-                    _ = cpy.PyList_SetItem(list_obj, i, _cached_none(cnv))
+                    _ = _list_set(list_obj, i, _cached_none(cnv))
                     pos = after2
                 else:
                     if after2 + blen2 + 2 > end:
@@ -1846,9 +1880,9 @@ def _parse_node(
                     # decoding is per-Reader, so hoist the check out of the
                     # helper: the common no-encoding path skips its frame
                     if cnv.enabled:
-                        _ = cpy.PyList_SetItem(list_obj, i, _leaf_payload(ptr, after2, blen2, cnv))
+                        _ = _list_set(list_obj, i, _leaf_payload(ptr, after2, blen2, cnv))
                     else:
-                        _ = cpy.PyList_SetItem(list_obj, i, _bytes_slice_payload(ptr, after2, blen2))
+                        _ = _list_set(list_obj, i, _bytes_slice_payload(ptr, after2, blen2))
                     pos = after2 + blen2 + 2
                 continue
             if t2 == TYPE_INT:
@@ -1861,7 +1895,7 @@ def _parse_node(
                 if st2 == ST_PROTO_ERR:
                     _ = _decref(list_obj)
                     return _proto_node(start, ERR_BAD_INT)
-                _ = cpy.PyList_SetItem(list_obj, i, _long(value2))
+                _ = _list_set(list_obj, i, _long(value2))
                 pos = after2
                 continue
             if t2 == TYPE_SIMPLE or t2 == TYPE_ERROR:
@@ -1871,16 +1905,16 @@ def _parse_node(
                     return _incomplete_node(start)
                 var pstart2 = pos + 1
                 if t2 == TYPE_ERROR:
-                    _ = cpy.PyList_SetItem(
+                    _ = _list_set(
                         list_obj, i,
                         _error_marker(ptr.unsafe_offset(pstart2), crlf2 - pstart2))
                     saw_err = True
                 elif cnv.enabled:
-                    _ = cpy.PyList_SetItem(
+                    _ = _list_set(
                         list_obj, i,
                         _leaf_payload(ptr, pstart2, crlf2 - pstart2, cnv))
                 else:
-                    _ = cpy.PyList_SetItem(
+                    _ = _list_set(
                         list_obj, i,
                         _bytes_slice_payload(ptr, pstart2, crlf2 - pstart2))
                 pos = crlf2 + 2
@@ -1900,9 +1934,9 @@ def _parse_node(
             if child.status == ST_PUSH:
                 # nested push: tag for the wrapper's PushNotification walk
                 saw_err = True
-                _ = cpy.PyList_SetItem(list_obj, i, _push_marker(child.payload.steal_data()))
+                _ = _list_set(list_obj, i, _push_marker(child.payload.steal_data()))
             else:
-                _ = cpy.PyList_SetItem(list_obj, i, child.payload.steal_data())
+                _ = _list_set(list_obj, i, child.payload.steal_data())
             pos = child.pos
         var out_status: UInt8 = ST_PUSH if t == TYPE_PUSH else ST_OK
         var out_node = Node(out_status, pos, PythonObject(from_owned=list_obj))
@@ -1977,28 +2011,27 @@ def _parse_node(
             return _proto_node(start, ERR_MAX_DEPTH)
         if count2 > (end - after_int2) // 3:
             return _incomplete_node(start)
-        ref cpy3 = Python().cpython()
-        var set_list = cpy3.PyList_New(count2)
+        var set_list = _list_new(count2)
         var spos = after_int2
         var saw_err2 = False
         for i2 in range(count2):
             var child2 = _parse_node(ptr, spos, end, depth + 1, cnv)
             if child2.status == ST_INCOMPLETE:
-                _ = cpy3.Py_DecRef(set_list)
+                _ = _decref(set_list)
                 return _incomplete_node(start)
             if child2.status == ST_PROTO_ERR:
-                _ = cpy3.Py_DecRef(set_list)
+                _ = _decref(set_list)
                 return _proto_node_byte(start, child2.err_code, child2.err_byte)
             if child2.status == ST_DICT_ERR:
-                _ = cpy3.Py_DecRef(set_list)
+                _ = _decref(set_list)
                 return child2^
             if child2.had_err:
                 saw_err2 = True
             if child2.status == ST_PUSH:
                 saw_err2 = True
-                _ = cpy3.PyList_SetItem(set_list, i2, _push_marker(child2.payload.steal_data()))
+                _ = _list_set(set_list, i2, _push_marker(child2.payload.steal_data()))
             else:
-                _ = cpy3.PyList_SetItem(set_list, i2, child2.payload.steal_data())
+                _ = _list_set(set_list, i2, child2.payload.steal_data())
             spos = child2.pos
         var set_node = Node(ST_OK, spos, PythonObject(from_owned=set_list))
         set_node.had_err = saw_err2
@@ -2017,33 +2050,32 @@ def _parse_node(
             return _proto_node(start, ERR_MAX_DEPTH)
         if pairs > (end - after_int3) // 6:
             return _incomplete_node(start)
-        ref cpy4 = Python().cpython()
-        var dict_obj = cpy4.PyDict_New()
+        var dict_obj = _dict_new()
         var mpos = after_int3
         var saw_err3 = False
         for i3 in range(pairs):
             var key_node = _parse_node(ptr, mpos, end, depth + 1, cnv)
             if key_node.status == ST_INCOMPLETE:
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 return _incomplete_node(start)
             if key_node.status == ST_PROTO_ERR:
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 return _proto_node_byte(start, key_node.err_code, key_node.err_byte)
             if key_node.status == ST_DICT_ERR:
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 return key_node^
             if key_node.had_err:
                 saw_err3 = True
             mpos = key_node.pos
             var val_node = _parse_node(ptr, mpos, end, depth + 1, cnv)
             if val_node.status == ST_INCOMPLETE:
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 return _incomplete_node(start)
             if val_node.status == ST_PROTO_ERR:
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 return _proto_node_byte(start, val_node.err_code, val_node.err_byte)
             if val_node.status == ST_DICT_ERR:
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 return val_node^
             if val_node.had_err:
                 saw_err3 = True
@@ -2054,14 +2086,14 @@ def _parse_node(
             if val_node.status == ST_PUSH:
                 saw_err3 = True
                 vp = _push_marker(vp)
-            var rc = cpy4.PyDict_SetItem(dict_obj, kp, vp)
-            _ = cpy4.Py_DecRef(kp)
-            _ = cpy4.Py_DecRef(vp)
+            var rc = _dict_set(dict_obj, kp, vp)
+            _ = _decref(kp)
+            _ = _decref(vp)
             if rc != 0:
                 # unhashable key: keep CPython's TypeError (type, args and
                 # message) for the wrapper to raise
                 var dict_exc = external_call["PyErr_GetRaisedException", PyObjectPtr]()
-                _ = cpy4.Py_DecRef(dict_obj)
+                _ = _decref(dict_obj)
                 if Int(dict_exc) == 0:
                     return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=_cached_none(cnv)))
                 return Node(ST_DICT_ERR, mpos, PythonObject(from_owned=dict_exc))
