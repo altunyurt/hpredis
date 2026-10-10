@@ -162,6 +162,13 @@ struct Reader(Defaultable, Movable, Writable):
     var none_obj: Int
     # the wrapper's notEnoughData object, returned by gets() on a partial reply
     var not_enough_obj: Int
+    # weakref.WeakMethod to the wrapper's _handle_gets_result, called only for
+    # the rare outcomes (protocol error, push, nested markers, decode failure)
+    var wrapper_ref: Int
+    # Py_TYPE(tuple): tells a status tuple from a finished reply
+    var tuple_type: Int
+    # highway mode routes gets() to the table/arena scan
+    var highway: Bool
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
     # one frame per open container of the reply being scanned (hiredis'
@@ -191,6 +198,9 @@ struct Reader(Defaultable, Movable, Writable):
         self.hw_incomplete_tuple = 0
         self.none_obj = 0
         self.not_enough_obj = 0
+        self.wrapper_ref = 0
+        self.tuple_type = 0
+        self.highway = False
         self.needs_scan = False
         self.scan_frames = List[ScanFrame]()
         self.buf_obj = 0
@@ -310,22 +320,91 @@ struct Reader(Defaultable, Movable, Writable):
         return PythonObject(0)
 
     @staticmethod
-    def gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], sd: Int) raises -> PythonObject:
-        """hiredis-shaped gets(): one core call per reply.
+    def set_wrapper(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], handler: PythonObject
+    ) raises -> PythonObject:
+        """Cache a weakref.WeakMethod to the wrapper's rare-outcome handler.
 
-        The common cases return the finished object (or the cached
-        notEnoughData sentinel) directly, with no status tuple.  Rare
-        outcomes (nested markers, pushes, protocol errors, decode failures)
-        keep the (status, payload) tuple contract for the wrapper's finalizer.
+        Weak on purpose: the wrapper owns this core, so a strong ref would be
+        an uncollectable cycle (CPython cannot see through the Mojo object).
+        It is only called for non-clean replies, so a call here never costs a
+        Python frame on the hot path.
         """
+        if self_ptr[].wrapper_ref != 0:
+            _decref(_int_ptr(self_ptr[].wrapper_ref))
+        self_ptr[].wrapper_ref = Int(handler.steal_data())
+        return PythonObject(0)
+
+    @staticmethod
+    def set_highway_mode(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], value: PythonObject
+    ) raises -> PythonObject:
+        self_ptr[].highway = _raw_int(value.steal_data()) != 0
+        return PythonObject(0)
+
+    @staticmethod
+    def _tuple_type_ptr(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> Int:
+        """Py_TYPE(tuple), cached once; reply values are never tuples, so a
+        tuple result can only be one of our (status, payload) markers."""
+        if self_ptr[].tuple_type == 0:
+            var empty = _tuple_new(0)
+            # ob_type sits right after ob_refcnt in every PyObject
+            self_ptr[].tuple_type = Int(
+                Pointer[Int, MutAnyOrigin](
+                    unsafe_from_address=Int(empty) + 8)[])
+            _decref(empty)
+        return self_ptr[].tuple_type
+
+    @staticmethod
+    def _call_rare(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], payload: PyObjectPtr, sd: Int
+    ) raises -> PythonObject:
+        """Hand a (status, payload) tuple to the wrapper's finalizer.
+
+        Resolves the WeakMethod (None once the wrapper is gone, which means no
+        one can be calling this) and calls it with (result, should_decode).
+        A NULL return leaves the pending exception to propagate.
+        """
+        var method = external_call["PyObject_CallNoArgs", PyObjectPtr](
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].wrapper_ref))
+        if Int(method) == 0:
+            return PythonObject(from_owned=payload)
+        var args = _tuple_new(2)
+        _tuple_set(args, 0, payload)
+        _tuple_set(args, 1, _long(sd))
+        var result = external_call["PyObject_CallObject", PyObjectPtr](
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(method)),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(args)))
+        _ = _decref(args)
+        _ = _decref(method)
+        return PythonObject(from_owned=result)
+
+    @staticmethod
+    def gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], sd: Int) raises -> PythonObject:
+        """hiredis-shaped gets(): one core call per reply, no Python frame.
+
+        Clean replies, the notEnoughData sentinel and highway results return
+        directly.  Anything else is a (status, payload) tuple and goes to the
+        wrapper's finalizer through a weak method, so the common path never
+        re-enters Python.
+        """
+        if self_ptr[].highway:
+            var hw = Reader.highway_gets(self_ptr).steal_data()
+            if self_ptr[].wrapper_ref != 0 and _is_status_tuple(
+                    hw, Reader._tuple_type_ptr(self_ptr), True):
+                return Reader._call_rare(self_ptr, hw, sd)
+            return PythonObject(from_owned=hw)
         if not self_ptr[].proto_err and self_ptr[].consumed >= self_ptr[].buf_len:
             return Reader._not_enough_result(self_ptr)
-        return Reader.try_gets(self_ptr, sd)
+        var payload = Reader.try_gets(self_ptr, sd).steal_data()
+        if self_ptr[].wrapper_ref != 0 and _is_status_tuple(
+                payload, Reader._tuple_type_ptr(self_ptr), False):
+            return Reader._call_rare(self_ptr, payload, sd)
+        return PythonObject(from_owned=payload)
 
     @staticmethod
     def try_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], sd: Int) raises -> PythonObject:
         if self_ptr[].proto_err:
-            # sticky protocol error (matches hiredis): keep raising
             return _status_tuple(ST_PROTO_ERR, _bytes_payload(self_ptr[].proto_err_msg))
         if self_ptr[].consumed >= self_ptr[].buf_len:
             return Reader._incomplete_result(self_ptr)
@@ -465,6 +544,9 @@ struct Reader(Defaultable, Movable, Writable):
         if self_ptr[].not_enough_obj != 0:
             _decref(_int_ptr(self_ptr[].not_enough_obj))
             self_ptr[].not_enough_obj = 0
+        if self_ptr[].wrapper_ref != 0:
+            _decref(_int_ptr(self_ptr[].wrapper_ref))
+            self_ptr[].wrapper_ref = 0
         return PythonObject(0)
 
     @staticmethod
@@ -655,7 +737,7 @@ struct Reader(Defaultable, Movable, Writable):
         status 2: protocol error (sticky, like gets) -> (2, message, None).
         """
         if self_ptr[].consumed >= self_ptr[].buf_len:
-            return Reader._hw_incomplete_result(self_ptr)
+            return Reader._not_enough_result(self_ptr)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         var start = self_ptr[].consumed
         if self_ptr[].needs_scan:
@@ -664,17 +746,19 @@ struct Reader(Defaultable, Movable, Writable):
             # longer rewrites the whole table per feed.  Slices are recorded
             # once, by the full walk below, after the reply is complete.
             if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
-                return Reader._hw_incomplete_result(self_ptr)
+                return Reader._not_enough_result(self_ptr)
             self_ptr[].needs_scan = False
         self_ptr[].highway_slices.clear()
         var res = _scan_highway(ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start, 1)
         if res.status == ST_INCOMPLETE:
             self_ptr[].needs_scan = True
             self_ptr[].highway_slices.clear()
-            return Reader._hw_incomplete_result(self_ptr)
+            return Reader._not_enough_result(self_ptr)
         if res.status == ST_PROTO_ERR:
             self_ptr[].proto_err = True
             self_ptr[].proto_err_msg = _err_text(res.err_code, res.err_byte)
+            # 3-tuple: the only status marker highway_gets returns, so the
+            # wrapper can tell it from a (table, arena) result
             return _hw_tuple(
                 _long(Int(ST_PROTO_ERR)),
                 _bytes_payload(self_ptr[].proto_err_msg), _none_payload())
@@ -695,11 +779,13 @@ struct Reader(Defaultable, Movable, Writable):
         var arena = PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
             unsafe_from_address=self_ptr[].buf_obj))
         _incref(arena)
-        return _hw_tuple(
-            _long(Int(ST_OK)),
-            PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
-                unsafe_from_address=table)),
-            arena)
+        # (table, arena): the final value for a complete highway reply, so
+        # gets() can return it without unwrapping a status row
+        var out = _tuple_new(2)
+        _tuple_set(out, 0, PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
+            unsafe_from_address=table)))
+        _tuple_set(out, 1, arena)
+        return PythonObject(from_owned=out)
 
     def write_to(self, mut writer: Some[Writer]):
         t"Reader(buffered={self.buf_len - self.consumed})".write_to(writer)
@@ -2203,6 +2289,22 @@ def _raw_reader(py_self: PyObjectPtr) -> Pointer[mut=True, Reader, MutAnyOrigin]
         unsafe_from_address=Int(py_self) + MOJO_VALUE_OFFSET)
 
 
+def _is_status_tuple(p: PyObjectPtr, tuple_type: Int, highway: Bool) -> Bool:
+    """True when a core result is one of our (status, payload) markers.
+
+    Reply values are never tuples, so classic mode treats any tuple as a
+    marker.  Highway mode returns (table, arena) for a complete reply, so
+    only its 3-tuple protocol-error form counts.
+    """
+    if tuple_type == 0 or Int(p) == 0:
+        return False
+    if Int(Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(p) + 8)[]) != tuple_type:
+        return False
+    if not highway:
+        return True
+    return Int(Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(p) + 16)[]) == 3
+
+
 def _raw_int(p: PyObjectPtr) -> Int:
     """Read a Python int argument straight off the borrowed pointer.
 
@@ -2294,11 +2396,13 @@ def _raw_try_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedO
 
 
 def _raw_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
-    if Int(nargs) != 1:
+    var sd = 1  # hiredis' shouldDecode default
+    if Int(nargs) == 1:
+        sd = _raw_int(args.unsafe_offset(0)[])
+        if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+            return PyObjectPtr()
+    elif Int(nargs) != 0:
         return _raw_arity(1, Int(nargs))
-    var sd = _raw_int(args.unsafe_offset(0)[])
-    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
-        return PyObjectPtr()
     try:
         return Reader.gets(_raw_reader(py_self), sd).steal_data()
     except e:
@@ -2377,6 +2481,8 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_py_c_method(_raw_try_gets, "try_gets") \
             .def_py_c_method(_raw_gets, "gets") \
             .def_py_c_method(_raw_set_not_enough_data, "set_not_enough_data") \
+            .def_method[Reader.set_wrapper]("set_wrapper") \
+            .def_method[Reader.set_highway_mode]("set_highway_mode") \
             .def_py_c_method(_raw_free, "free") \
             .def_py_c_method(_raw_dispose, "dispose") \
             .def_py_c_method(_raw_set_decoding, "set_decoding") \

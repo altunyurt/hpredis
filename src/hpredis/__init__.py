@@ -58,10 +58,14 @@ class Reader:
     ):
         self._core = _core.Reader()
         self._feed = self._core.feed
-        self._gets = self._core.gets
         # the core returns this object from gets() on a partial reply, so the
         # incomplete path never re-enters Python
         self._core.set_not_enough_data(notEnoughData)
+        # highway routing lives in the core so gets() is one native call
+        self._core.set_highway_mode(1 if highway_mode else 0)
+        # weak: the core is owned by this wrapper, so a strong ref to the
+        # handler would be an uncollectable cycle
+        self._core.set_wrapper(weakref.WeakMethod(self._handle_gets_result))
         protocol_error = protocolError if protocolError is not None else ProtocolError
         reply_error = replyError if replyError is not None else ReplyError
         if not callable(protocol_error):
@@ -124,26 +128,29 @@ class Reader:
             raise TypeError("a bytes-like object is required")
         self._closed = False
 
-    def gets(self, should_decode=True):
-        """Get one reply, in one core call.
+    def __getattr__(self, name):
+        """Route ``gets`` to the core.
 
-        The flag is hiredis-py's `shouldDecode`: it defaults to True and only
-        decodes when an encoding is configured (redis-py's disable_decoding
-        path calls gets(False)).  The core returns the finished object for
-        clean replies and the notEnoughData sentinel for a partial one; only
-        rare outcomes come back as a (status, payload) tuple.
+        The core owns the reply: clean replies, the ``notEnoughData``
+        sentinel and highway results all come back without a Python frame.
+        Only rare outcomes (protocol errors, pushes, nested markers, decode
+        failures) call ``_handle_gets_result`` back, through the WeakMethod
+        registered in ``__init__``.  The bound core method is cached in the
+        instance dict, so this runs once per Reader.
         """
-        if self._highway:
-            return self._highway_gets()
-        result = self._gets(1 if should_decode else 0)
-        if type(result) is tuple:
-            # rare outcomes (protocol error, nested markers, push, unhashable
-            # map key, decode failure) still arrive as (status, payload)
-            return self._handle_gets_result(result, should_decode)
-        return result
+        if name == "gets":
+            fn = self._core.gets
+            self.__dict__["gets"] = fn
+            return fn
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}")
 
     def _handle_gets_result(self, result, should_decode):
-        status, payload = result
+        # indexing, not unpacking: highway protocol errors arrive as
+        # (status, message, None) so they cannot be confused with a
+        # (table, arena) result
+        status = result[0]
+        payload = result[1]
         if status == 1:
             # only reachable when no notEnoughData object was registered
             return self._notEnoughData
@@ -202,29 +209,6 @@ class Reader:
             # still needs the Python walk
             replies = [self._finalize(r, should_decode) for r in replies]
         return replies
-
-    def _highway_gets(self):
-        """Highway mode returns (table, arena) for a complete reply.
-
-        table is n*24 bytes of little-endian int64 triples
-        (offset, length, resp_type) with offsets into arena, which is the
-        bytearray holding the reply.  Rows are pre-order: byte payloads are
-        slices, nil is length -1, bool carries its 't'/'f' byte, and
-        containers emit a header row (length = child count) before their
-        children.  Read the table in one call:
-            triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
-        then read payloads directly from arena:
-            off, length, typ = triples[0]  # single bulk: one payload row
-            arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
-        A view of the arena owns its data: it stays valid across feeds (the
-        core moves to a fresh arena instead of resizing an exported one).
-        """
-        status, table, arena = self._core.highway_gets()
-        if status == 1:
-            return self._notEnoughData
-        if status == 2:
-            raise self._protocolError(self._decode_msg(table))
-        return (table, arena)
 
     def set_encoding(self, encoding=None, errors=None):
         """hiredis parity: change encoding/errors; validates eagerly."""
