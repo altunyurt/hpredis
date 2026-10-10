@@ -310,7 +310,7 @@ struct Reader(Defaultable, Movable, Writable):
         return PythonObject(0)
 
     @staticmethod
-    def gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
+    def gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], sd: Int) raises -> PythonObject:
         """hiredis-shaped gets(): one core call per reply.
 
         The common cases return the finished object (or the cached
@@ -320,16 +320,15 @@ struct Reader(Defaultable, Movable, Writable):
         """
         if not self_ptr[].proto_err and self_ptr[].consumed >= self_ptr[].buf_len:
             return Reader._not_enough_result(self_ptr)
-        return Reader.try_gets(self_ptr, should_decode)
+        return Reader.try_gets(self_ptr, sd)
 
     @staticmethod
-    def try_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
+    def try_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], sd: Int) raises -> PythonObject:
         if self_ptr[].proto_err:
             # sticky protocol error (matches hiredis): keep raising
             return _status_tuple(ST_PROTO_ERR, _bytes_payload(self_ptr[].proto_err_msg))
         if self_ptr[].consumed >= self_ptr[].buf_len:
             return Reader._incomplete_result(self_ptr)
-        var sd = Int(py=should_decode)
         var cnv = DecodeCtx(
             enabled=self_ptr[].dec_enabled and sd != 0,
             encoding=self_ptr[].dec_encoding,
@@ -486,7 +485,7 @@ struct Reader(Defaultable, Movable, Writable):
         return PythonObject(0)
 
     @staticmethod
-    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject, max_replies: PythonObject) raises -> PythonObject:
+    def drain(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], sd: Int, max_n: Int) raises -> PythonObject:
         """Parse every complete reply currently buffered, into one list.
 
         Top-level error replies become replyError instances here: the wrapper's
@@ -496,9 +495,7 @@ struct Reader(Defaultable, Movable, Writable):
         object, preserving its traceback without calling the callable again.
         max_replies > 0 stops the batch early; the rest stays buffered.
         """
-        var max_n = Int(py=max_replies)
         var collected = List[PyObjectPtr]()
-        var sd = Int(py=should_decode)
         var re_ptr = self_ptr[].reply_error
         var raise_exc = _none_payload()
         var cnv = DecodeCtx(
@@ -2206,6 +2203,17 @@ def _raw_reader(py_self: PyObjectPtr) -> Pointer[mut=True, Reader, MutAnyOrigin]
         unsafe_from_address=Int(py_self) + MOJO_VALUE_OFFSET)
 
 
+def _raw_int(p: PyObjectPtr) -> Int:
+    """Read a Python int argument straight off the borrowed pointer.
+
+    Passing it through a PythonObject (incref + `Int(py=...)`) costs two GIL
+    checks and two runtime global lookups per call, which is a large share of
+    a small reply's parse time.  A non-int argument leaves a pending
+    TypeError; the caller returns NULL and CPython raises it.
+    """
+    return Int(external_call["PyLong_AsSsize_t", c_ssize_t](p))
+
+
 def _raw_arity(want: Int, got: Int) -> PyObjectPtr:
     """METH_FASTCALL passes nargs unchecked: out-of-range reads would segfault."""
     return raise_python_exception(
@@ -2276,9 +2284,11 @@ def _raw_feed(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigi
 def _raw_try_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
     if Int(nargs) != 1:
         return _raw_arity(1, Int(nargs))
+    var sd = _raw_int(args.unsafe_offset(0)[])
+    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+        return PyObjectPtr()
     try:
-        return Reader.try_gets(_raw_reader(py_self), PythonObject(
-            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+        return Reader.try_gets(_raw_reader(py_self), sd).steal_data()
     except e:
         return raise_python_exception(e)
 
@@ -2286,9 +2296,11 @@ def _raw_try_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedO
 def _raw_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
     if Int(nargs) != 1:
         return _raw_arity(1, Int(nargs))
+    var sd = _raw_int(args.unsafe_offset(0)[])
+    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+        return PyObjectPtr()
     try:
-        return Reader.gets(_raw_reader(py_self), PythonObject(
-            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+        return Reader.gets(_raw_reader(py_self), sd).steal_data()
     except e:
         return raise_python_exception(e)
 
@@ -2316,12 +2328,12 @@ def _raw_set_maxbuf(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntracke
 def _raw_drain(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
     if Int(nargs) != 2:
         return _raw_arity(2, Int(nargs))
+    var sd = _raw_int(args.unsafe_offset(0)[])
+    var max_n = _raw_int(args.unsafe_offset(1)[])
+    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+        return PyObjectPtr()
     try:
-        return Reader.drain(
-            _raw_reader(py_self),
-            PythonObject(from_borrowed=args.unsafe_offset(0)[]),
-            PythonObject(from_borrowed=args.unsafe_offset(1)[]),
-        ).steal_data()
+        return Reader.drain(_raw_reader(py_self), sd, max_n).steal_data()
     except e:
         return raise_python_exception(e)
 
