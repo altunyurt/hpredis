@@ -57,7 +57,6 @@ class Reader:
         highway_mode=False,
     ):
         self._core = _core.Reader()
-        self._feed = self._core.feed
         # the core returns this object from gets() on a partial reply, so the
         # incomplete path never re-enters Python
         self._core.set_not_enough_data(notEnoughData)
@@ -85,7 +84,6 @@ class Reader:
         self._notEnoughData = notEnoughData
         self._highway = highway_mode
         self._maxbuf = 16384  # hiredis' default
-        self._closed = False
         self._dec_errors = None
         self._sync_decoding()
         if isinstance(reply_error, type):
@@ -103,31 +101,6 @@ class Reader:
                     re_get = lambda: reply_error
             self._core.set_reply_error(re_get, True)
 
-    def feed(self, data, start=None, stop=None):
-        """Feed any buffer-protocol object; (start, stop) is a hiredis-style
-        (offset, length) window."""
-        if start is not None or stop is not None:
-            # hiredis feed(data, start, length): third arg is a LENGTH
-            view = memoryview(data)  # TypeError for non-buffer objects
-            n = len(view)
-            if start is None:
-                start = 0
-            if start < 0 or start > n:
-                raise ValueError("invalid offset")
-            if stop is None:
-                stop = n - start  # offset-only form: to the end
-            if stop < 0:
-                raise ValueError("invalid length")
-            if start + stop > n:
-                raise ValueError("invalid length")
-            if not (start == 0 and stop == n):
-                # the whole-buffer case (redis-py: feed(buf, 0, n)) stays on
-                # the fast path and skips the memoryview object entirely
-                data = view[start : start + stop]
-        if self._feed(data) != 0:
-            raise TypeError("a bytes-like object is required")
-        self._closed = False
-
     def __getattr__(self, name):
         """Route ``gets`` to the core.
 
@@ -138,9 +111,11 @@ class Reader:
         registered in ``__init__``.  The bound core method is cached in the
         instance dict, so this runs once per Reader.
         """
-        if name == "gets":
-            fn = self._core.gets
-            self.__dict__["gets"] = fn
+        if name == "gets" or name == "feed":
+            # bound to the core object, which holds the state; cached in the
+            # instance dict so the lookup happens once per Reader
+            fn = getattr(self._core, name)
+            self.__dict__[name] = fn
             return fn
         raise AttributeError(
             f"{type(self).__name__!r} object has no attribute {name!r}")
@@ -249,10 +224,13 @@ class Reader:
         return self._core.buffered() > 0
 
     def close(self):
-        """Release the core's arena now instead of at garbage collection."""
+        """Release the core's arena now instead of at garbage collection.
+
+        free() is idempotent, so a closed reader can be fed again and closed
+        again without tracking state here (feed lives in the core).
+        """
         core = getattr(self, "_core", None)
-        if core is not None and not getattr(self, "_closed", False):
-            self._closed = True
+        if core is not None:
             core.free()
 
     def __del__(self):

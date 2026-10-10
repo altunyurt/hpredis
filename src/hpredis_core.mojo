@@ -212,26 +212,77 @@ struct Reader(Defaultable, Movable, Writable):
     def feed(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], data: PythonObject) raises -> PythonObject:
         """Copy a buffer-protocol object (bytes/bytearray/memoryview) into the arena."""
         var raw = data.steal_data()  # steal_data detaches the ref: release it below
+        var rc = Reader.feed_ptr(self_ptr, raw)
+        _decref(raw)
+        return PythonObject(rc)
+
+    @staticmethod
+    def feed_ptr(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], raw: PyObjectPtr) raises -> Int:
+        """Copy a borrowed buffer-protocol object into the arena; 1 = not a buffer."""
         var view = PyBuffer()
         var rc = external_call["PyObject_GetBuffer", c_int](
             raw, Pointer(to=view), c_int(0))  # PyBUF_SIMPLE
         if rc != 0:
-            _decref(raw)
-            _pyerr_clear()  # the wrapper raises TypeError
-            return PythonObject(1)
-        var n = Int(view.len)
-        if n > 0:
-            if _arena_pinned(self_ptr[]):
-                _arena_detach(self_ptr[], self_ptr[].buf_cap)
-            _ensure_cap(self_ptr[], self_ptr[].buf_len + n)
-            var dst = Pointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=self_ptr[].buf_addr + self_ptr[].buf_len)
-            _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](
-                dst, view.buf.value(), c_size_t(n))
-            self_ptr[].buf_len += n
+            _pyerr_clear()
+            return 1
+        Reader._feed_copy(self_ptr, view.buf.value(), Int(view.len))
         _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
-        _decref(raw)
-        return PythonObject(0)
+        return 0
+
+    @staticmethod
+    def _feed_copy(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], src: Pointer[UInt8, MutUntrackedOrigin], n: Int) raises:
+        if n <= 0:
+            return
+        if _arena_pinned(self_ptr[]):
+            _arena_detach(self_ptr[], self_ptr[].buf_cap)
+        _ensure_cap(self_ptr[], self_ptr[].buf_len + n)
+        var dst = Pointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=self_ptr[].buf_addr + self_ptr[].buf_len)
+        _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](dst, src, c_size_t(n))
+        self_ptr[].buf_len += n
+
+    @staticmethod
+    def feed_window(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin],
+        raw: PyObjectPtr,
+        start_obj: PyObjectPtr,
+        stop_obj: PyObjectPtr,
+    ) raises -> Int:
+        """hiredis-style window feed: feed(data, start, length).
+
+        Returns 0 on success, 1 for a non-buffer object, 2 for a bad offset,
+        3 for a bad length; the raw entry point raises with the messages the
+        Python wrapper used to produce.
+        """
+        var view = PyBuffer()
+        var rc = external_call["PyObject_GetBuffer", c_int](
+            raw, Pointer(to=view), c_int(0))
+        if rc != 0:
+            _pyerr_clear()
+            return 1
+        var none_ptr = Reader._none_ptr(self_ptr)
+        var n = Int(view.len)
+        var start = 0
+        if Int(start_obj) != none_ptr:
+            start = _raw_int(start_obj)
+            if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+                _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+                return 1
+        if start < 0 or start > n:
+            _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+            return 2
+        var length = n - start  # offset-only form: to the end
+        if Int(stop_obj) != none_ptr:
+            length = _raw_int(stop_obj)
+            if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+                _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+                return 1
+        if length < 0 or start + length > n:
+            _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+            return 3
+        Reader._feed_copy(self_ptr, view.buf.value().unsafe_offset(start), length)
+        _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+        return 0
 
     @staticmethod
     def set_decoding(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], encoding: PythonObject, errors: PythonObject, kind: PythonObject) raises -> PythonObject:
@@ -2373,14 +2424,38 @@ def _raw_highway_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrac
         return raise_python_exception(e)
 
 
+def _raw_raise(exc: ExceptionType, msg: String) -> PyObjectPtr:
+    return raise_python_exception(Error(msg), exc)
+
+
 def _raw_feed(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
-    if Int(nargs) != 1:
-        return _raw_arity(1, Int(nargs))
+    if Int(nargs) < 1 or Int(nargs) > 3:
+        return _raw_arity(3, Int(nargs))
+    var self_ptr = _raw_reader(py_self)
+    var raw = args.unsafe_offset(0)[]
+    if Int(nargs) == 1:
+        try:
+            if Reader.feed_ptr(self_ptr, raw) != 0:
+                return _raw_raise(ExceptionType.TypeError, "a bytes-like object is required")
+        except e:
+            return raise_python_exception(e)
+        return _none_payload()
+    var none_addr = Reader._none_ptr(self_ptr)
+    var stop_obj = _int_ptr(none_addr)
+    if Int(nargs) == 3 and Int(args.unsafe_offset(2)[]) != none_addr:
+        stop_obj = args.unsafe_offset(2)[]
+    var rc = 0
     try:
-        return Reader.feed(_raw_reader(py_self), PythonObject(
-            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+        rc = Reader.feed_window(self_ptr, raw, args.unsafe_offset(1)[], stop_obj)
     except e:
         return raise_python_exception(e)
+    if rc == 1:
+        return _raw_raise(ExceptionType.TypeError, "a bytes-like object is required")
+    if rc == 2:
+        return _raw_raise(ExceptionType.ValueError, "invalid offset")
+    if rc == 3:
+        return _raw_raise(ExceptionType.ValueError, "invalid length")
+    return _none_payload()
 
 
 def _raw_try_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
