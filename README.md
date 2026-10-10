@@ -130,10 +130,14 @@ highway mode, and redis-py integration through fakeredis.
 ## Status
 
 Classic mode parses RESP2 and RESP3 and matches hiredis-py on the tested
-behavior and error cases. Bulk arrays and batched reads perform close to
-hiredis-py. A single `gets()` call has more per-call overhead, which is the
-main performance item left. Planned work: Python 3.9 to 3.11 support,
-published wheels for more platforms, and lower per-call overhead.
+behavior and error cases. `feed()` and `gets()` are single native calls:
+every core method is registered through CPython's vectorcall slot instead of
+the Mojo binding trampoline, and `gets()` returns the finished object from
+the core, so a reply never re-enters Python. `drain()` still leads on large
+batches. The gap that remains is inside the core parser (Python object
+construction, nested containers), not the Mojo boundary. Planned work:
+Python 3.9 to 3.11 support, published wheels for more platforms, and a
+native `Reader` type to drop the last Python frame.
 
 ## Limitations
 

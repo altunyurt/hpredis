@@ -52,15 +52,16 @@ def _tracemalloc_growth(fn, iterations):
     return sum(s.size_diff for s in after.compare_to(before, "filename"))
 
 
-def test_error_replies_batch_like_scalars():
+def test_error_replies_parse_in_order():
     r = hpredis.Reader()
     r.feed(b"-ERR one\r\n-ERR two\r\n")
     first = r.gets()
     assert isinstance(first, hpredis.ReplyError) and first.args[0] == "ERR one"
-    # the batch consumed both replies in one core call
-    assert r._core.buffered() == 0
+    # one reply per gets(): the second stays buffered in the arena
+    assert r._core.buffered() == len(b"-ERR two\r\n")
     second = r.gets()
     assert isinstance(second, hpredis.ReplyError) and second.args[0] == "ERR two"
+    assert r._core.buffered() == 0
 
 
 def test_reader_release_frees_cached_references():
@@ -426,36 +427,38 @@ def test_reader_gc_does_not_leak_the_arena():
 # --- gets(): bounded read-ahead --------------------------------------------
 
 
-def test_gets_prefetches_clean_replies_and_tracks_unread_bytes():
+def test_gets_tracks_unread_bytes():
     r = reader()
     r.feed(b"+A\r\n$1\r\nb\r\n:7\r\n")
     assert r.gets() == b"A"
-    assert r._core.buffered() == 0
     assert r.len() == len(b"$1\r\nb\r\n:7\r\n")
     assert r.has_data()
     assert r.gets() == b"b"
     assert r.len() == len(b":7\r\n")
     assert r.gets() == 7
     assert r.len() == 0
+    assert not r.has_data()
     assert r.gets() is False
+    assert r.len() == 0
 
 
 # --- gets(): direct success return across the Mojo/Python boundary ----------
 
 
-def test_gets_read_ahead_queue_is_bounded():
+def test_gets_consumes_one_reply_per_call():
     data = b"+OK\r\n" * 5000
     r = reader()
     r.feed(data)
     assert r.gets() == b"OK"
-    assert r._pending_count - r._pending_index == 4095
-    assert r._core.buffered() == (5000 - 4096) * len(b"+OK\r\n")
+    # no read-ahead queue: everything else stays in the core arena
+    assert r.has_data()
     assert r.len() == len(data) - len(b"+OK\r\n")
     assert r.drain() == [b"OK"] * 4999
     assert r.len() == 0
+    assert not r.has_data()
 
 
-def test_gets_prefetch_keeps_partial_tail_for_next_feed():
+def test_gets_keeps_partial_tail_for_next_feed():
     r = reader()
     r.feed(b"+one\r\n+par")
     assert r.gets() == b"one"
@@ -468,7 +471,7 @@ def test_gets_prefetch_keeps_partial_tail_for_next_feed():
     assert r.len() == 0
 
 
-def test_gets_prefetch_does_not_run_reply_error_early():
+def test_reply_error_factory_runs_once_per_error_reply():
     calls = []
 
     class Boom(Exception):
@@ -488,7 +491,7 @@ def test_gets_prefetch_does_not_run_reply_error_early():
     assert r.gets() == b"last"
 
 
-def test_prefetched_replies_honor_later_encoding_and_drain():
+def test_replies_after_set_encoding_decode_in_drain():
     r = reader()
     r.feed(b"$1\r\nx\r\n$1\r\ny\r\n")
     assert r.gets(False) == b"x"

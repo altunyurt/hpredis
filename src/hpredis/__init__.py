@@ -58,9 +58,10 @@ class Reader:
     ):
         self._core = _core.Reader()
         self._feed = self._core.feed
-        self._prefetch = self._core.prefetch_clean
-        self._try_gets = self._core.try_gets
-        self._clear_pending()
+        self._gets = self._core.gets
+        # the core returns this object from gets() on a partial reply, so the
+        # incomplete path never re-enters Python
+        self._core.set_not_enough_data(notEnoughData)
         protocol_error = protocolError if protocolError is not None else ProtocolError
         reply_error = replyError if replyError is not None else ReplyError
         if not callable(protocol_error):
@@ -82,14 +83,6 @@ class Reader:
         self._maxbuf = 16384  # hiredis' default
         self._closed = False
         self._dec_errors = None
-        # True when the core reported no complete reply; no bytes can appear
-        # before the next feed(), so gets()/has_data() can answer without a
-        # core call (redis-py polls both between reads)
-        self._exhausted = True
-        # a non-clean reply head was seen: skip the prefetch probe until a
-        # clean reply or the next feed (error-heavy streams otherwise pay a
-        # wasted core call per reply)
-        self._special = False
         self._sync_decoding()
         if isinstance(reply_error, type):
             # classes are safe to cache strongly; a strong cache of a bound
@@ -129,63 +122,30 @@ class Reader:
                 data = view[start : start + stop]
         if self._feed(data) != 0:
             raise TypeError("a bytes-like object is required")
-        self._exhausted = False
-        self._special = False
         self._closed = False
 
     def gets(self, should_decode=True):
-        """Get one reply. The flag is hiredis-py's `shouldDecode`: it
-        defaults to True and only decodes when an encoding is configured
-        (redis-py's disable_decoding path calls gets(False))."""
+        """Get one reply, in one core call.
+
+        The flag is hiredis-py's `shouldDecode`: it defaults to True and only
+        decodes when an encoding is configured (redis-py's disable_decoding
+        path calls gets(False)).  The core returns the finished object for
+        clean replies and the notEnoughData sentinel for a partial one; only
+        rare outcomes come back as a (status, payload) tuple.
+        """
         if self._highway:
             return self._highway_gets()
-        pending_index = self._pending_index
-        pending_count = self._pending_count
-        if self._exhausted and pending_index >= pending_count:
-            return self._notEnoughData
-        if (
-            pending_index >= pending_count
-            and self._encoding is None
-            and not self._special
-        ):
-            prefetched = self._prefetch()
-            if type(prefetched) is not tuple:
-                return prefetched
-            if len(prefetched) == 3:
-                _, self._pending, self._pending_lengths = prefetched
-                self._pending_count = len(self._pending)
-                self._pending_index = 0
-                self._pending_bytes = sum(self._pending_lengths)
-                pending_index, pending_count = 0, self._pending_count
-            elif prefetched[0] == 1:
-                self._exhausted = True
-                return self._notEnoughData
-            elif prefetched[0] == 10:
-                # lone reply that drained the buffer: the poll before the next
-                # socket read answers here instead of crossing into the core
-                self._exhausted = True
-                return prefetched[1]
-            else:
-                self._special = True
-        if pending_index < pending_count:
-            reply = self._pending[pending_index]
-            self._pending_index = pending_index + 1
-            self._pending_bytes -= self._pending_lengths[pending_index]
-            if pending_index + 1 == pending_count:
-                self._clear_pending()
-            if self._encoding is not None and should_decode:
-                return self._finalize(reply, should_decode)
-            return reply
-        result = self._try_gets(should_decode)
-        if type(result) is not tuple:
-            self._special = False
-            return result
-        return self._handle_gets_result(result, should_decode)
+        result = self._gets(1 if should_decode else 0)
+        if type(result) is tuple:
+            # rare outcomes (protocol error, nested markers, push, unhashable
+            # map key, decode failure) still arrive as (status, payload)
+            return self._handle_gets_result(result, should_decode)
+        return result
 
     def _handle_gets_result(self, result, should_decode):
         status, payload = result
         if status == 1:
-            self._exhausted = True
+            # only reachable when no notEnoughData object was registered
             return self._notEnoughData
         if status == 6:
             # error markers inside the reply: _finalize builds replyError
@@ -209,17 +169,11 @@ class Reader:
             raise payload  # CPython's TypeError from the dict insert
         raise TypeError("unhashable type in map reply")  # status 5
 
-    def _clear_pending(self):
-        self._pending = []
-        self._pending_lengths = []
-        self._pending_index = 0
-        self._pending_count = 0
-        self._pending_bytes = 0
-
     def drain(self, should_decode=True, max_replies=0):
         """Parse every complete reply already buffered and return them as a
-        list, in one core call.  A `while r.gets() is not False: ...` loop
-        pays the Mojo<->CPython boundary per reply; drain pays it once.
+        list, in one core call.  `gets()` is now a native call per reply, but
+        drain still wins on large batches: it compacts the arena once and
+        builds one result list instead of one Python object chain per reply.
 
         max_replies > 0 caps the batch size (the rest stays buffered), so a
         100 MB buffer does not have to become one list.
@@ -231,10 +185,6 @@ class Reader:
             raise RuntimeError("drain() is not available in highway mode")
         if not isinstance(max_replies, int) or max_replies < 0:
             raise ValueError("max_replies must be a non-negative int")
-        pending_replies = []
-        if self._pending_index < self._pending_count:
-            pending_replies = self._pending[self._pending_index : self._pending_count]
-            self._clear_pending()
         replies, proto_msg, dict_exc, had_markers, dec_failed, raise_exc = self._core.drain(
             should_decode, max_replies
         )
@@ -247,11 +197,7 @@ class Reader:
         if raise_exc is not None:
             # the core captured the original exception from replyError
             raise raise_exc
-        if pending_replies:
-            replies = pending_replies + replies
-            if had_markers or (self._encoding is not None and should_decode):
-                replies = [self._finalize(r, should_decode) for r in replies]
-        elif had_markers:
+        if had_markers:
             # nested markers (an array holding an error) are the only case that
             # still needs the Python walk
             replies = [self._finalize(r, should_decode) for r in replies]
@@ -312,15 +258,14 @@ class Reader:
         return self._maxbuf
 
     def len(self):
-        return self._pending_bytes + self._core.buffered()
+        return self._core.buffered()
 
     def has_data(self):
         """redis-py 8 can_read() support."""
-        return self._pending_index < self._pending_count or self._core.buffered() > 0
+        return self._core.buffered() > 0
 
     def close(self):
         """Release the core's arena now instead of at garbage collection."""
-        self._clear_pending()
         core = getattr(self, "_core", None)
         if core is not None and not getattr(self, "_closed", False):
             self._closed = True

@@ -3,7 +3,11 @@
 
 from std.python import Python, PythonObject
 from std.python.python_object import PyObjectPtr
-from std.python.bindings import PythonModuleBuilder
+from std.python.bindings import (
+    ExceptionType,
+    PythonModuleBuilder,
+    raise_python_exception,
+)
 from std.os import abort
 from std.ffi import external_call, c_int, c_long, c_ssize_t, c_size_t
 from std.collections import List
@@ -63,19 +67,6 @@ comptime ST_DICT_ERR = 5
 comptime ST_OK_MARKERS = 6
 # a leaf failed strict decoding: the wrapper re-raises the real codec error
 comptime ST_DECODE_ERR = 7
-# private prefetch outcomes
-comptime ST_PREFETCH_SPECIAL = 8
-comptime ST_PREFETCH_BATCH = 9
-# lone reply that emptied the buffer: wrapper latches _exhausted for the
-# poll redis-py runs before its next socket read
-comptime ST_PREFETCH_DRAINED = 10
-
-# ponytail: cap batches between replies at 64 KiB / 4096 items; one oversized
-# scalar is unavoidable. Raise the cap only if profiling justifies it.
-comptime PREFETCH_MAX_REPLIES = 4096
-comptime PREFETCH_MAX_BYTES = 65536
-
-# nested error marker sentinel (tuple[0]); unique, never valid RESP data
 comptime ERR_SENTINEL = "\x00hpredis-error\x00"
 # nested push reply sentinel; the wrapper rebuilds a PushNotification
 comptime PUSH_SENTINEL = "\x00hpredis-push\x00"
@@ -169,6 +160,8 @@ struct Reader(Defaultable, Movable, Writable):
     var hw_incomplete_tuple: Int
     # one owned Py_None reference reused for every nil reply
     var none_obj: Int
+    # the wrapper's notEnoughData object, returned by gets() on a partial reply
+    var not_enough_obj: Int
     # a build attempt hit an incomplete reply: scan before rebuilding
     var needs_scan: Bool
     # one frame per open container of the reply being scanned (hiredis'
@@ -197,6 +190,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.incomplete_tuple = 0
         self.hw_incomplete_tuple = 0
         self.none_obj = 0
+        self.not_enough_obj = 0
         self.needs_scan = False
         self.scan_frames = List[ScanFrame]()
         self.buf_obj = 0
@@ -278,6 +272,33 @@ struct Reader(Defaultable, Movable, Writable):
         self_ptr[].reply_error = Int(reply_error.steal_data())
         self_ptr[].reply_error_weak = Int(py=is_weak) != 0
         return PythonObject(0)
+
+    @staticmethod
+    def set_not_enough_data(
+        self_ptr: Pointer[mut=True, Self, MutAnyOrigin], value: PythonObject
+    ) raises -> PythonObject:
+        """Cache the wrapper's notEnoughData object for gets().
+
+        Held strongly: it is a sentinel (False/Ellipsis/None), so the
+        incomplete-return path stays allocation-free and cannot form a cycle.
+        """
+        if self_ptr[].not_enough_obj != 0:
+            _decref(_int_ptr(self_ptr[].not_enough_obj))
+        self_ptr[].not_enough_obj = Int(value.steal_data())
+        return PythonObject(0)
+
+    @staticmethod
+    def gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
+        """hiredis-shaped gets(): one core call per reply.
+
+        The common cases return the finished object (or the cached
+        notEnoughData sentinel) directly, with no status tuple.  Rare
+        outcomes (nested markers, pushes, protocol errors, decode failures)
+        keep the (status, payload) tuple contract for the wrapper's finalizer.
+        """
+        if not self_ptr[].proto_err and self_ptr[].consumed >= self_ptr[].buf_len:
+            return Reader._not_enough_result(self_ptr)
+        return Reader.try_gets(self_ptr, should_decode)
 
     @staticmethod
     def try_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin], should_decode: PythonObject) raises -> PythonObject:
@@ -362,114 +383,6 @@ struct Reader(Defaultable, Movable, Writable):
         return _status_tuple(ST_PROTO_ERR, _bytes_payload(self_ptr[].proto_err_msg))
 
     @staticmethod
-    def prefetch_clean(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
-        """Batch clean scalar replies; return a lone reply directly.
-
-        Containers stay for try_gets.  Error replies are batched too when the
-        cached factory is a class (no raise path), so error-heavy streams pay
-        one core call per batch instead of one per reply; a custom/raising
-        callable stays special.  Used only when decoding is disabled.  Batched
-        replies include wire lengths so the wrapper can preserve len().
-        """
-        var collected = List[PyObjectPtr]()
-        var lengths = List[PyObjectPtr]()
-        var first_payload = PyObjectPtr()
-        var first_length = 0
-        var reply_count = 0
-        var batch_bytes = 0
-        var special = False
-        if self_ptr[].proto_err:
-            return _status_tuple(ST_PREFETCH_SPECIAL, _none_payload())
-        if self_ptr[].consumed >= self_ptr[].buf_len:
-            return Reader._incomplete_result(self_ptr)
-        var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
-        var cnv = DecodeCtx(
-            enabled=False,
-            encoding=self_ptr[].dec_encoding,
-            errors=self_ptr[].dec_errors,
-            kind=self_ptr[].dec_kind,
-            failed=False,
-            none_obj=Reader._none_ptr(self_ptr))
-        while reply_count < PREFETCH_MAX_REPLIES and batch_bytes < PREFETCH_MAX_BYTES:
-            if self_ptr[].consumed >= self_ptr[].buf_len:
-                break
-            if self_ptr[].needs_scan:
-                var scan_status = _scan_needs(self_ptr[], ptr)
-                if scan_status == ST_INCOMPLETE:
-                    break
-                self_ptr[].needs_scan = False
-                if scan_status == ST_PROTO_ERR:
-                    special = True
-                    break
-            var pos = self_ptr[].consumed
-            var t = ptr.unsafe_offset(pos)[]
-            var payload = PyObjectPtr()
-            var wire_len = 0
-            if t == TYPE_ERROR:
-                # classes never raise from construction; batch them so
-                # error-heavy streams pay one core call per batch
-                if self_ptr[].reply_error == 0 or self_ptr[].reply_error_weak:
-                    special = True
-                    break
-                var crlf = _find_crlf(ptr, pos + 1, self_ptr[].buf_len)
-                if crlf < 0:
-                    self_ptr[].needs_scan = True
-                    break
-                self_ptr[].needs_scan = False
-                var inst = _error_to_instance(
-                    self_ptr[].reply_error, False, ptr.unsafe_offset(pos + 1),
-                    crlf - (pos + 1), self_ptr[].none_obj)
-                if inst == 0:
-                    if Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
-                        _pyerr_clear()
-                    special = True
-                    break
-                payload = PyObjectPtr(upcast_from=Pointer[UInt8, MutUntrackedOrigin](
-                    unsafe_from_address=inst))
-                wire_len = crlf + 2 - pos
-                self_ptr[].consumed = crlf + 2
-            else:
-                # Top-level pushes carry the wrapper's PushNotification type;
-                # arrays/maps/sets parse here, because a clean one is exactly
-                # the object try_gets would return.  Marker cases (nested
-                # error/push) fall through to try_gets via the had_err check.
-                if t == TYPE_PUSH:
-                    special = True
-                    break
-                var node = _parse_node(ptr, pos, self_ptr[].buf_len, 1, cnv)
-                if node.status == ST_INCOMPLETE:
-                    self_ptr[].needs_scan = True
-                    break
-                self_ptr[].needs_scan = False
-                if node.status != ST_OK or node.had_err or cnv.failed:
-                    special = True
-                    break
-                wire_len = node.pos - pos
-                self_ptr[].consumed = node.pos
-                payload = node.payload.steal_data()
-            if reply_count == 0:
-                first_payload = payload
-                first_length = wire_len
-            else:
-                if reply_count == 1:
-                    collected.append(first_payload)
-                    lengths.append(_long(first_length))
-                collected.append(payload)
-                lengths.append(_long(wire_len))
-            reply_count += 1
-            batch_bytes += wire_len
-        _compact(self_ptr[])
-        if reply_count == 0:
-            if special:
-                return _status_tuple(ST_PREFETCH_SPECIAL, _none_payload())
-            return Reader._incomplete_result(self_ptr)
-        if reply_count == 1:
-            if self_ptr[].consumed >= self_ptr[].buf_len:
-                return _prefetch_drained_result(first_payload)
-            return PythonObject(from_owned=first_payload)
-        return _prefetch_batch_result(_list_of(collected), _list_of(lengths))
-
-    @staticmethod
     def _incomplete_result(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
         """Return the cached (ST_INCOMPLETE, None) tuple, incref'd per caller."""
         if self_ptr[].incomplete_tuple == 0:
@@ -478,6 +391,19 @@ struct Reader(Defaultable, Movable, Writable):
         var t = _int_ptr(self_ptr[].incomplete_tuple)
         _incref(t)
         return PythonObject(from_owned=t)
+
+    @staticmethod
+    def _not_enough_result(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
+        """Owned reference to the wrapper's notEnoughData object.
+
+        Falls back to the cached (ST_INCOMPLETE, None) tuple when none was
+        registered; the wrapper's status handler answers that case.
+        """
+        if self_ptr[].not_enough_obj == 0:
+            return Reader._incomplete_result(self_ptr)
+        var p = _int_ptr(self_ptr[].not_enough_obj)
+        _incref(p)
+        return PythonObject(from_owned=p)
 
     @staticmethod
     def _none_ptr(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) -> Int:
@@ -515,6 +441,9 @@ struct Reader(Defaultable, Movable, Writable):
         if self_ptr[].none_obj != 0:
             _decref(_int_ptr(self_ptr[].none_obj))
             self_ptr[].none_obj = 0
+        if self_ptr[].not_enough_obj != 0:
+            _decref(_int_ptr(self_ptr[].not_enough_obj))
+            self_ptr[].not_enough_obj = 0
         return PythonObject(0)
 
     @staticmethod
@@ -1057,21 +986,6 @@ def _hw_tuple(a: PyObjectPtr, b: PyObjectPtr, c: PyObjectPtr) raises -> PythonOb
     _tuple_set(t, 0, a)
     _tuple_set(t, 1, b)
     _tuple_set(t, 2, c)
-    return PythonObject(from_owned=t)
-
-
-def _prefetch_batch_result(replies: PyObjectPtr, lengths: PyObjectPtr) raises -> PythonObject:
-    var t = _tuple_new(3)
-    _tuple_set(t, 0, _long(ST_PREFETCH_BATCH))
-    _tuple_set(t, 1, replies)
-    _tuple_set(t, 2, lengths)
-    return PythonObject(from_owned=t)
-
-
-def _prefetch_drained_result(payload: PyObjectPtr) raises -> PythonObject:
-    var t = _tuple_new(2)
-    _tuple_set(t, 0, _long(ST_PREFETCH_DRAINED))
-    _tuple_set(t, 1, payload)
     return PythonObject(from_owned=t)
 
 
@@ -2244,6 +2158,169 @@ def _record_slice(mut slices: List[ResponseSlice], offset: Int, length: Int, res
     slices.append(s^)
 
 
+# === Raw METH_FASTCALL entry points ===
+# The generic binding trampoline (variadic pack build + registry downcast)
+# costs ~78ns per call: measured 103ns for a do-nothing def_method against
+# 25ns for the same function registered through CPython's vectorcall slot.
+# The parser pays feed()+gets() per socket read, so every method registers a
+# raw entry point.  PyMojoObject[Reader] stores the Mojo value directly after
+# the PyObject header (ob_refcnt + ob_type = 16 bytes on 64-bit).
+
+comptime MOJO_VALUE_OFFSET = 16
+
+
+def _raw_reader(py_self: PyObjectPtr) -> Pointer[mut=True, Reader, MutAnyOrigin]:
+    return Pointer[mut=True, Reader, MutAnyOrigin](
+        unsafe_from_address=Int(py_self) + MOJO_VALUE_OFFSET)
+
+
+def _raw_arity(want: Int, got: Int) -> PyObjectPtr:
+    """METH_FASTCALL passes nargs unchecked: out-of-range reads would segfault."""
+    return raise_python_exception(
+        Error(t"<mojo function>() takes {want} positional argument(s) but {got} were given"),
+        ExceptionType.TypeError)
+
+
+def _raw_free(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = args
+    if Int(nargs) != 0:
+        return _raw_arity(0, Int(nargs))
+    try:
+        return Reader.free(_raw_reader(py_self)).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_dispose(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = args
+    if Int(nargs) != 0:
+        return _raw_arity(0, Int(nargs))
+    try:
+        return Reader.dispose(_raw_reader(py_self)).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_clear_decoding(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = args
+    if Int(nargs) != 0:
+        return _raw_arity(0, Int(nargs))
+    try:
+        return Reader.clear_decoding(_raw_reader(py_self)).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_buffered(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = args
+    if Int(nargs) != 0:
+        return _raw_arity(0, Int(nargs))
+    try:
+        return Reader.buffered(_raw_reader(py_self)).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_highway_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = args
+    if Int(nargs) != 0:
+        return _raw_arity(0, Int(nargs))
+    try:
+        return Reader.highway_gets(_raw_reader(py_self)).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_feed(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 1:
+        return _raw_arity(1, Int(nargs))
+    try:
+        return Reader.feed(_raw_reader(py_self), PythonObject(
+            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_try_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 1:
+        return _raw_arity(1, Int(nargs))
+    try:
+        return Reader.try_gets(_raw_reader(py_self), PythonObject(
+            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 1:
+        return _raw_arity(1, Int(nargs))
+    try:
+        return Reader.gets(_raw_reader(py_self), PythonObject(
+            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_set_not_enough_data(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 1:
+        return _raw_arity(1, Int(nargs))
+    try:
+        return Reader.set_not_enough_data(_raw_reader(py_self), PythonObject(
+            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_set_maxbuf(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 1:
+        return _raw_arity(1, Int(nargs))
+    try:
+        return Reader.set_maxbuf(_raw_reader(py_self), PythonObject(
+            from_borrowed=args.unsafe_offset(0)[])).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_drain(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 2:
+        return _raw_arity(2, Int(nargs))
+    try:
+        return Reader.drain(
+            _raw_reader(py_self),
+            PythonObject(from_borrowed=args.unsafe_offset(0)[]),
+            PythonObject(from_borrowed=args.unsafe_offset(1)[]),
+        ).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_set_reply_error(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 2:
+        return _raw_arity(2, Int(nargs))
+    try:
+        return Reader.set_reply_error(
+            _raw_reader(py_self),
+            PythonObject(from_borrowed=args.unsafe_offset(0)[]),
+            PythonObject(from_borrowed=args.unsafe_offset(1)[]),
+        ).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
+def _raw_set_decoding(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    if Int(nargs) != 3:
+        return _raw_arity(3, Int(nargs))
+    try:
+        return Reader.set_decoding(
+            _raw_reader(py_self),
+            PythonObject(from_borrowed=args.unsafe_offset(0)[]),
+            PythonObject(from_borrowed=args.unsafe_offset(1)[]),
+            PythonObject(from_borrowed=args.unsafe_offset(2)[]),
+        ).steal_data()
+    except e:
+        return raise_python_exception(e)
+
+
 # === Module entry ===
 
 @export
@@ -2252,18 +2329,19 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
         var m = PythonModuleBuilder("hpredis_core")
         _ = m.add_type[Reader]("Reader") \
             .def_init_defaultable[Reader]() \
-            .def_method[Reader.feed]("feed") \
-            .def_method[Reader.try_gets]("try_gets") \
-            .def_method[Reader.prefetch_clean]("prefetch_clean") \
-            .def_method[Reader.free]("free") \
-            .def_method[Reader.dispose]("dispose") \
-            .def_method[Reader.set_decoding]("set_decoding") \
-            .def_method[Reader.set_reply_error]("set_reply_error") \
-            .def_method[Reader.set_maxbuf]("set_maxbuf") \
-            .def_method[Reader.clear_decoding]("clear_decoding") \
-            .def_method[Reader.drain]("drain") \
-            .def_method[Reader.buffered]("buffered") \
-            .def_method[Reader.highway_gets]("highway_gets")
+            .def_py_c_method(_raw_feed, "feed") \
+            .def_py_c_method(_raw_try_gets, "try_gets") \
+            .def_py_c_method(_raw_gets, "gets") \
+            .def_py_c_method(_raw_set_not_enough_data, "set_not_enough_data") \
+            .def_py_c_method(_raw_free, "free") \
+            .def_py_c_method(_raw_dispose, "dispose") \
+            .def_py_c_method(_raw_set_decoding, "set_decoding") \
+            .def_py_c_method(_raw_set_reply_error, "set_reply_error") \
+            .def_py_c_method(_raw_set_maxbuf, "set_maxbuf") \
+            .def_py_c_method(_raw_clear_decoding, "clear_decoding") \
+            .def_py_c_method(_raw_drain, "drain") \
+            .def_py_c_method(_raw_buffered, "buffered") \
+            .def_py_c_method(_raw_highway_gets, "highway_gets")
         return m.finalize()
     except e:
         abort(String("error creating hpredis_core:", e))
