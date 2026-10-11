@@ -19,3 +19,8 @@ Sequential small commands measure the server round-trip, not the reader;
 use `-P` (pipeline) or `-s` (payload size) to put the parser on the hot
 path. Script benchmarks work the same way
 (`... with_hpredis.py benchmarks/connection_handshake.py`).
+
+Restart Redis before a comparison and interleave the configurations instead
+of running them back to back: a server that has been up under load drifts,
+which once turned a 7% difference into 11% between two runs of the same
+workload.
