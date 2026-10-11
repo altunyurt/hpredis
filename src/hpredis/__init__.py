@@ -171,7 +171,7 @@ class Reader:
 
     def drain(self, should_decode=True, max_replies=0):
         """Parse every complete reply already buffered and return them as a
-        list, in one core call.  `gets()` is now a native call per reply, but
+        list, in one core call.  `gets()` is a native call per reply, but
         drain still wins on large batches: it compacts the arena once and
         builds one result list instead of one Python object chain per reply.
 

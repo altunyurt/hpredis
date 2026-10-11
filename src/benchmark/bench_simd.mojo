@@ -22,7 +22,7 @@ def make_corpus(header_bytes: Int, bulk_len: Int, count: Int) -> List[UInt8]:
     header += String(bulk_len)
     header += "\r\n"
     for c in header.bytes():
-        
+
         buf.append(Int(c).cast[DType.uint8]())
     var fill: UInt8 = 65
     for _ in range(count):

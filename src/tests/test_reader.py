@@ -30,7 +30,7 @@ def test_protocol_error_with_custom_class():
     r.gets()
 
 def test_protocol_error_with_custom_callable():
-  
+
   class CustomException(Exception):
     pass
 
@@ -188,7 +188,7 @@ def test_dict_with_unhashable_key(reader):
     with pytest.raises(TypeError):
       reader.gets()
 
-def test_vector(reader):  
+def test_vector(reader):
   reader.feed(b">4\r\n+pubsub\r\n+message\r\n+channel\r\n+message\r\n")
   result = reader.gets()
   assert isinstance(result, hiredis.PushNotification)
@@ -333,7 +333,7 @@ def test_nested_multi_bulk_depth(reader):
   assert [[[[b"!"]]]] == reader.gets()
 
 def test_subclassable(reader):
-  
+
   class TestReader(hiredis.Reader):
     pass
 
