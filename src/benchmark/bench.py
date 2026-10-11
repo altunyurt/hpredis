@@ -2,7 +2,12 @@
 
 Advisory numbers, single machine, no isolation.  Run:
     python src/benchmark/bench.py
-Prints one table row per corpus: MB/s, ops/s, GC pause profile, speedup.
+
+Every cell is wall-clock throughput in MB/s = payload bytes x iterations /
+seconds, best of 3 timed runs.  Timed per iteration: feed() + gets() + the
+consumer work named in the row (view creation, decode, ...).  Excluded:
+socket reads, the Redis server, GPU transfers, process start.  The legend
+printed at the start names every row and the statistic.
 """
 
 import gc
@@ -236,6 +241,7 @@ def bench_ai():
     n_emb = 1000
 
     print("\nMGET of 1000 x 1536-dim float32 embeddings (%d bytes, %.1f MB)"
+          " [MB/s and ns/embedding; best of 3 runs; feed+gets+consumer; no socket/server/GPU]"
           % (len(mget), len(mget) / 1e6))
     iters = 200
     rows = [
@@ -254,6 +260,7 @@ def bench_ai():
 
     n_chunks = (len(stream) + CHUNK - 1) // CHUNK
     print("\n64 KiB socket reads of the same 1000-element reply (%d bytes, %.1f MB, %d chunks)"
+          " [same unit and statistic; one gets() after each feed; 'whole' = single feed for comparison]"
           % (len(stream), len(stream) / 1e6, n_chunks))
     iters = 30
     rows = [
@@ -273,7 +280,24 @@ def bench_ai():
               % (label, len(stream) * iters / t / 1e6, "x%.2f" % (base / t)))
 
 
+def legend():
+    print("legend")
+    print("  unit       MB/s = payload bytes x iterations / wall seconds (higher is better);")
+    print("             ns/embedding = wall nanoseconds per element per iteration")
+    print("  statistic  best of 3 timed runs per cell (best-of-N suppresses run-to-run drift)")
+    print("  timed      feed() + gets() + the consumer work named in the row")
+    print("  excluded   socket reads, Redis server, GPU transfers, process start")
+    print("  rows       classic     Reader.gets() -> Python objects (list/bytes/int)")
+    print("             drain       hpredis drain() over the whole buffer, one call")
+    print("             highway     highway_mode gets() -> (table, arena), no payload read")
+    print("             hw+views    highway + one numpy view per payload row")
+    print("             hw+strided  highway + one strided numpy view (zero copy)")
+    print("             decode      encoding=\"utf-8\" on every payload (decode_responses=True)")
+    print("  gc         gc.get_stats() collected deltas, one run each (not best-of-3)")
+
+
 def main():
+    legend()
     print("corpus | reader | speedup | gc(hiredis/hpredis)")
     for name, (payload, iters) in make_corpora().items():
         bench_one(name, payload, iters)
