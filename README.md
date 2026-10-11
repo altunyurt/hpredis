@@ -58,6 +58,10 @@ Rows cover every item in wire order: payload slice, nil `-1`, bool its `t`/`f`
 byte, container a header row with its child count. A view keeps the arena
 alive, so payloads stay valid after the reader is collected or new data fed.
 
+Highway pays off for many-payload replies (MGET, LRANGE): one table instead
+of one object per payload. For a single bulk reply, classic mode is faster —
+the table costs more than one `bytes` object.
+
 ### Bulk decoders
 
 One native pass over the table:
