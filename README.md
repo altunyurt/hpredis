@@ -100,21 +100,21 @@ FT.SEARCH. Each asserts its own result and runs in the test suite.
 
 ## Feature comparison
 
-| | hiredis-py 3.4.2 | hpredis |
+| capability | hiredis-py 3.4.2 | hpredis |
 |---|---|---|
-| `Reader` API (`feed`, `gets`, `len`, `has_data`, `set_encoding`, `setmaxbuf`, `getmaxbuf`) | yes | yes |
-| Extensions: `drain()` (batched parse, optional `max_replies`) and `close()` | no | yes |
-| `pack_command`, `HiredisError`, `ProtocolError`, `ReplyError`, `PushNotification` | yes | yes |
-| RESP2, and the RESP3 types redis-py uses (maps, sets, pushes, doubles, booleans, nulls, big numbers, verbatim strings, attributes) | yes | yes |
-| Error text, length caps, and nesting depth | reference | matching, checked by the tests and a differential fuzzer |
-| Zero-copy payload reads through highway mode | no | yes, byte offsets into the receive buffer |
-| Bulk decoders over a highway table (`highway_ints`, `highway_floats`, `highway_gather`) | no | yes, one native pass |
-| Zero-copy Arrow `binary_view` import (`hpredis.arrow`, optional pyarrow) | no | yes, the arena is the data buffer |
-| redis-py 8.1 (sync + asyncio clients, pipelines, `decode_responses`) | yes | yes; the hiredis parser path is driven directly in tests, plus fakeredis integration |
-| Runtime dependencies | none | none |
-| Implementation | C extension, vendored hiredis | Mojo extension |
-| Python versions | 3.9 to 3.15, PyPy | 3.12 and newer |
-| Platforms | Linux, macOS, Windows, FreeBSD | Linux wheel; source build needs the Mojo toolchain |
+| Drop-in Reader API, exception classes, `pack_command` | reference | same interface; `__version__` 3.4.2 |
+| RESP2 + RESP3 (maps, sets, pushes, doubles, bools, nulls, big numbers, verbatim, attributes) | yes | yes |
+| Error text, length caps, nesting depth | reference | matching (tests + differential fuzzer) |
+| redis-py (sync + asyncio) | yes | yes |
+| Payload access | one `bytes` object per payload | byte offsets into the receive buffer, no object per payload |
+| Batched replies | one `gets()` per reply | `drain()` parses every buffered reply in one call |
+| Typed numeric payloads | decode in Python per item | `highway_ints` / `highway_floats` → int64/float64 in one native pass |
+| Contiguous payloads | build objects, then join | `highway_gather` into one buffer, or into a buffer you own (pinned/GPU) |
+| Arrow / dataframes | no | zero-copy `binary_view` over the arena (optional pyarrow) |
+
+No runtime dependencies on either side. hpredis is a Mojo extension for
+Python 3.12+, Linux wheel, source builds need the Mojo toolchain; hiredis-py
+is a C extension for Python 3.9–3.15/PyPy on Linux, macOS, Windows, FreeBSD.
 
 ## Install
 
