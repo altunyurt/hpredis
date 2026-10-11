@@ -33,6 +33,18 @@ table, arena = h.gets()
 triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
 off, length, resp_type = triples[0]
 arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
+
+# Bulk decoders: one native pass over the table, no per-row Python work.
+# highway_gather copies equal-length payloads back to back into a contiguous
+# array (or into `out`, e.g. pinned memory).  first_row=-1 auto-skips the
+# reply's container header and keeps a scalar reply's row.
+blob = hpredis.highway_gather(table, arena)   # same bytes as vec
+
+# highway_ints/highway_floats parse decimal payloads (SMEMBERS, ZRANGE, ...).
+i = hpredis.Reader(highway_mode=True)
+i.feed(b"*3\r\n$1\r\n7\r\n$3\r\n-12\r\n$2\r\n42\r\n")
+it, ia = i.gets()
+nums = np.frombuffer(hpredis.highway_ints(it, ia), dtype="<i8")   # [7, -12, 42]
 ```
 
 ## Feature comparison
@@ -45,6 +57,7 @@ arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 | Error text, length caps, and nesting depth | reference | matching, checked by the tests and a differential fuzzer |
 | Batched parse through `drain()` | no | yes, with an optional `max_replies` cap |
 | Zero-copy payload reads through highway mode | no | yes, byte offsets into the receive buffer |
+| Bulk decoders over a highway table (`highway_ints`, `highway_floats`, `highway_gather`) | no | yes, one native pass |
 | redis-py 8.1 (sync client, pipelines, `decode_responses`) | yes | yes, tested through fakeredis |
 | Runtime dependencies | none | none |
 | Implementation | C extension, vendored hiredis | Mojo extension |

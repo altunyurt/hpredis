@@ -23,11 +23,23 @@ __all__ = [
     "PushNotification",
     "Reader",
     "pack_command",
+    "highway_ints",
+    "highway_floats",
+    "highway_gather",
 ]
 # The hiredis-py API version this module emulates.  redis-py gates on this
 # value (redis/utils.py requires >= 3.2), so it describes the emulated API,
 # not this package's own release number.
 __version__ = "3.4.2"
+
+# Stateless highway-table decoders: one native pass over a (table, arena)
+# pair from Reader(highway_mode=True).gets(), replacing per-row Python work.
+# first_row=-1 auto-skips the reply's container header row and keeps a
+# scalar reply's single row; pass an explicit 0..rows to override.
+_H = _core.Reader()
+highway_ints = _H.highway_ints        # (table, arena, first_row=-1) -> bytearray of int64 LE
+highway_floats = _H.highway_floats    # (table, arena, first_row=-1) -> bytearray of float64
+highway_gather = _H.highway_gather    # (table, arena, first_row=-1, width=0, out=None)
 
 
 class HiredisError(Exception):

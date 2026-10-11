@@ -2761,6 +2761,286 @@ def _raw_set_decoding(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrac
         return raise_python_exception(e)
 
 
+# === Highway table decoders ===
+# Stateless: they read a highway (table, arena) pair and write a flat result
+# in one native pass, replacing per-row Python/numpy work.  Rows are the
+# 24-byte (offset, length, type) records produced by highway_gets().
+
+comptime TBL_ROW = 24
+
+
+def _tbl_buf(raw: PyObjectPtr, mut view: PyBuffer, writable: Bool) -> Bool:
+    """PyBUF_SIMPLE (or PyBUF_WRITABLE) view; on failure CPython's error stays set."""
+    var flags = c_int(1) if writable else c_int(0)
+    return external_call["PyObject_GetBuffer", c_int](raw, Pointer(to=view), flags) == 0
+
+
+def _tbl_release(mut view: PyBuffer):
+    _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+
+
+def _tbl_addr(mut view: PyBuffer) -> Int:
+    return 0 if Int(view.len) == 0 else Int(view.buf.value())
+
+
+def _tbl_container(ty: Int) -> Bool:
+    """True for container header rows ('*', '>', '~', '%', '|')."""
+    return ty == 42 or ty == 62 or ty == 124 or ty == 126 or ty == 37
+
+
+def _tbl_prep(
+    args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: Int, max_args: Int,
+    mut tv: PyBuffer, mut av: PyBuffer, mut first: Int, mut n: Int,
+) -> Bool:
+    """Validate (table, arena, first_row); False means an exception is set and no buffer is held.
+
+    first_row defaults to -1 = auto: a table starts with the reply's own
+    header row when the reply is a container, so auto skips row 0 only when
+    it is a container row; a scalar reply (GET of one blob) keeps its single
+    row instead of returning an empty result.  Explicit first_row is 0..rows.
+    """
+    if nargs < 2 or nargs > max_args:
+        _ = _raw_arity(max_args, nargs)
+        return False
+    first = -1
+    if nargs >= 3:
+        first = _raw_int(args.unsafe_offset(2)[])
+        if first == -1 and Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0:
+            return False
+    if not _tbl_buf(args.unsafe_offset(0)[], tv, False):
+        return False
+    if not _tbl_buf(args.unsafe_offset(1)[], av, False):
+        _tbl_release(tv)
+        return False
+    var rows = Int(tv.len) // TBL_ROW
+    if Int(tv.len) % TBL_ROW != 0:
+        _ = _raw_raise(ExceptionType.ValueError, "malformed table or first_row out of range")
+        _tbl_release(tv)
+        _tbl_release(av)
+        return False
+    if first == -1:
+        first = 0
+        if rows > 0 and _tbl_container(
+                Pointer[Int, MutAnyOrigin](unsafe_from_address=_tbl_addr(tv) + 16)[]):
+            first = 1
+    if first < 0 or first > rows:
+        _ = _raw_raise(ExceptionType.ValueError, "malformed table or first_row out of range")
+        _tbl_release(tv)
+        _tbl_release(av)
+        return False
+    n = rows - first
+    return True
+
+
+def _tbl_row(tp: Int, row: Int, alen: Int, mut off: Int, mut ln: Int) -> Int:
+    """0 = payload row; 1 = nil/container row; 2 = outside the arena."""
+    var base = tp + row * TBL_ROW
+    off = Pointer[Int, MutAnyOrigin](unsafe_from_address=base)[]
+    ln = Pointer[Int, MutAnyOrigin](unsafe_from_address=base + 8)[]
+    var ty = Pointer[Int, MutAnyOrigin](unsafe_from_address=base + 16)[]
+    if ln < 0 or _tbl_container(ty):
+        return 1
+    if off < 0 or off > alen or ln > alen - off:
+        return 2
+    return 0
+
+
+def _tbl_fail(code: Int, row: Int, what: String) -> PyObjectPtr:
+    var why = "is nil or a container" if code == 1 else ("lies outside the arena" if code == 2 else what)
+    return _raw_raise(ExceptionType.ValueError, String("table row ") + String(row) + " " + why)
+
+
+def _parse_i64(ap: Pointer[UInt8, MutAnyOrigin], off: Int, ln: Int, mut val: Int) -> Bool:
+    var i = 0
+    var neg = False
+    if ln > 0 and ap.unsafe_offset(off)[] == 45:
+        neg = True
+        i = 1
+    if i >= ln:
+        return False
+    var acc = UInt64(0)
+    var limit = UInt64(9223372036854775807) + (UInt64(1) if neg else UInt64(0))
+    while i < ln:
+        var d = Int(ap.unsafe_offset(off + i)[]) - 48
+        if d < 0 or d > 9:
+            return False
+        if acc > (limit - UInt64(d)) // UInt64(10):
+            return False
+        acc = acc * UInt64(10) + UInt64(d)
+        i += 1
+    val = Int(0) - Int(acc) if neg else Int(acc)
+    return True
+
+
+def _raw_highway_ints(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = py_self
+    var tv = PyBuffer()
+    var av = PyBuffer()
+    var first = 1
+    var n = 0
+    if not _tbl_prep(args, Int(nargs), 3, tv, av, first, n):
+        return PyObjectPtr()
+    var out = 0
+    try:
+        out = _new_arena(n * 8, 0, 0)
+    except e:
+        _tbl_release(tv)
+        _tbl_release(av)
+        return raise_python_exception(e)
+    var tp = _tbl_addr(tv)
+    var ap = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=_tbl_addr(av))
+    var alen = Int(av.len)
+    var dst = _arena_ptr(out)
+    var off = 0
+    var ln = 0
+    var val = 0
+    for i in range(n):
+        var code = _tbl_row(tp, first + i, alen, off, ln)
+        if code == 0 and not _parse_i64(ap, off, ln, val):
+            code = 3
+        if code != 0:
+            _decref(_int_ptr(out))
+            _tbl_release(tv)
+            _tbl_release(av)
+            return _tbl_fail(code, first + i, "is not a 64-bit integer")
+        _write_i64(dst, i * 8, val)
+    _tbl_release(tv)
+    _tbl_release(av)
+    return _int_ptr(out)
+
+
+def _raw_highway_floats(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = py_self
+    var tv = PyBuffer()
+    var av = PyBuffer()
+    var first = 1
+    var n = 0
+    if not _tbl_prep(args, Int(nargs), 3, tv, av, first, n):
+        return PyObjectPtr()
+    var out = 0
+    try:
+        out = _new_arena(n * 8, 0, 0)
+    except e:
+        _tbl_release(tv)
+        _tbl_release(av)
+        return raise_python_exception(e)
+    var tp = _tbl_addr(tv)
+    var ap = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=_tbl_addr(av))
+    var alen = Int(av.len)
+    var dst = _arena_ptr(out)
+    # _double_parse wants a CRLF-terminated scratch (< 326 chars); the arena
+    # copy keeps it independent of what follows the payload.
+    var scratch = external_call["malloc", Pointer[UInt8, MutAnyOrigin]](c_size_t(336))
+    var off = 0
+    var ln = 0
+    var val = Float64(0)
+    for i in range(n):
+        var code = _tbl_row(tp, first + i, alen, off, ln)
+        if code == 0:
+            if ln >= 326:
+                code = 3
+            else:
+                _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](scratch, ap.unsafe_offset(off), c_size_t(ln))
+                scratch.unsafe_offset(ln)[] = 13
+                if _double_parse(scratch, 0, ln, val) != ERR_NONE:
+                    code = 3
+        if code != 0:
+            external_call["free", NoneType](scratch)
+            _decref(_int_ptr(out))
+            _tbl_release(tv)
+            _tbl_release(av)
+            return _tbl_fail(code, first + i, "is not a float")
+        Pointer[Float64, MutAnyOrigin](unsafe_from_address=Int(dst) + i * 8)[] = val
+    external_call["free", NoneType](scratch)
+    _tbl_release(tv)
+    _tbl_release(av)
+    return _int_ptr(out)
+
+
+def _raw_highway_gather(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    """table_gather(table, arena, first_row=1, width=0, out=None): payloads of
+    equal length copied back to back into `out` (writable buffer) or a new bytearray."""
+    var tv = PyBuffer()
+    var av = PyBuffer()
+    var first = 1
+    var n = 0
+    if not _tbl_prep(args, Int(nargs), 5, tv, av, first, n):
+        return PyObjectPtr()
+    var tp = _tbl_addr(tv)
+    var ap = _tbl_addr(av)
+    var alen = Int(av.len)
+    var width = 0
+    if Int(nargs) >= 4:
+        width = _raw_int(args.unsafe_offset(3)[])
+        if width < 0 or (width == -1 and Int(external_call["PyErr_Occurred", PyObjectPtr]()) != 0):
+            if width < 0 and Int(external_call["PyErr_Occurred", PyObjectPtr]()) == 0:
+                _ = _raw_raise(ExceptionType.ValueError, "width must be >= 0")
+            _tbl_release(tv)
+            _tbl_release(av)
+            return PyObjectPtr()
+    var off = 0
+    var ln = 0
+    if width == 0 and n > 0:
+        var c0 = _tbl_row(tp, first, alen, off, ln)
+        if c0 != 0:
+            _tbl_release(tv)
+            _tbl_release(av)
+            return _tbl_fail(c0, first, "")
+        width = ln
+    var total = n * width
+    var out_raw = PyObjectPtr()
+    var have_out = Int(nargs) >= 5 and Int(args.unsafe_offset(4)[]) != Reader._none_ptr(_raw_reader(py_self))
+    var ov = PyBuffer()
+    var dst = 0
+    var out = 0
+    if have_out:
+        if not _tbl_buf(args.unsafe_offset(4)[], ov, True):
+            _tbl_release(tv)
+            _tbl_release(av)
+            return PyObjectPtr()
+        if Int(ov.len) < total:
+            _ = _raw_raise(ExceptionType.ValueError, "out buffer is smaller than n_rows * width")
+            _tbl_release(ov)
+            _tbl_release(tv)
+            _tbl_release(av)
+            return PyObjectPtr()
+        dst = _tbl_addr(ov)
+    else:
+        try:
+            out = _new_arena(total, 0, 0)
+        except e:
+            _tbl_release(tv)
+            _tbl_release(av)
+            return raise_python_exception(e)
+        dst = Int(_arena_ptr(out))
+    var bad = 0
+    var bad_row = 0
+    for i in range(n):
+        var code = _tbl_row(tp, first + i, alen, off, ln)
+        if code == 0 and ln != width:
+            code = 3
+        if code != 0:
+            bad = code
+            bad_row = first + i
+            break
+        _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=dst + i * width),
+            Pointer[UInt8, MutAnyOrigin](unsafe_from_address=ap + off), c_size_t(width))
+    _tbl_release(tv)
+    _tbl_release(av)
+    if have_out:
+        _tbl_release(ov)
+    if bad != 0:
+        if not have_out:
+            _decref(_int_ptr(out))
+        return _tbl_fail(bad, bad_row, "length differs from width " + String(width))
+    if have_out:
+        out_raw = args.unsafe_offset(4)[]
+        _incref(out_raw)
+        return out_raw
+    return _int_ptr(out)
+
+
 # === Module entry ===
 
 @export
@@ -2784,7 +3064,10 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_py_c_method(_raw_drain, "drain") \
             .def_py_c_method(_raw_buffered, "buffered") \
             .def_py_c_method(_raw_has_data, "has_data") \
-            .def_py_c_method(_raw_highway_gets, "highway_gets")
+            .def_py_c_method(_raw_highway_gets, "highway_gets") \
+            .def_py_c_method(_raw_highway_ints, "highway_ints") \
+            .def_py_c_method(_raw_highway_floats, "highway_floats") \
+            .def_py_c_method(_raw_highway_gather, "highway_gather")
         return m.finalize()
     except e:
         abort(String("error creating hpredis_core:", e))
