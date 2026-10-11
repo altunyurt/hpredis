@@ -125,6 +125,17 @@ including `protocolError`, `replyError`, `encoding`, `errors`, and
 behavior it matches (3.4.2), which is the value redis-py checks before it
 enables its hiredis parser.
 
+## Examples
+
+Runnable scripts in [`examples/`](examples/): the hiredis drop-in and
+redis-py routing, embeddings into numpy, Arrow/pandas/polars dataframes, and
+an FT.SEARCH vector-search recipe. Each one asserts its own result and is
+run by the test suite.
+
+```bash
+python examples/numpy_embeddings.py
+```
+
 ## Highway mode
 
 `Reader(highway_mode=True)` returns `(table, arena)` from `gets()`. The table
