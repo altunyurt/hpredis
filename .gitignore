@@ -10,3 +10,4 @@ docs
 dev
 findings*.md
 gecici
+*.egg-info/

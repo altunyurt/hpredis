@@ -90,9 +90,7 @@ def run_highway(payload, iters, materialize=False):
             if materialize:
                 table, arena = got
                 # consumer model: one numpy call for the table, then one row
-                # view per payload.  No .tolist() on the columns: that builds
-                # a Python int per slice, which no consumer does and which
-                # dominated the earlier hw+views numbers.
+                # view per payload; tolist() only for the table walk
                 triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3).tolist()
                 for off, length, _ in triples:
                     if length > 0:

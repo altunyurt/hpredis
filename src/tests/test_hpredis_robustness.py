@@ -526,15 +526,14 @@ def test_huge_length_header_does_not_crash(payload):
     [
         b"$9223372036854775808\r\n",   # Int64.max + 1
         b"$18446744073709551614\r\n",  # UInt64.max - 1
-        b"$18446744073709551615\r\n",  # UInt64.max: used to wrap to nil
+        b"$18446744073709551615\r\n",  # UInt64.max: rejected, not a nil reply
         b"$18446744073709551616\r\n",  # UInt64 overflow
         b"=18446744073709551615\r\n",  # the same cap on verbatim lengths
     ],
 )
 def test_over_int64_lengths_match_hiredis(payload):
-    # _read_len_fast used to return Int(value) for any UInt64, so UInt64.max
-    # wrapped to -1 and $18446744073709551615 came back as a nil reply;
-    # hiredis rejects every length above Int64.max as "Bad bulk string length"
+    # every length above Int64.max must be rejected as "Bad bulk string
+    # length" (a wrapped UInt64.max would otherwise look like a nil reply)
     outcomes = []
     for mod in (hiredis, hpredis):
         r = mod.Reader()

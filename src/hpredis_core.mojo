@@ -1,5 +1,5 @@
-# Phase 4: AI Highway — Mojo core (phase 3 core + memoryview + compaction-safe highway).
-# Compile: mojo build phase4.mojo --emit shared-lib -o hpredis_core.so
+# hpredis core: the RESP reader behind the hpredis Python package.
+# Build: ./build.sh
 
 from std.python import Python, PythonObject
 from std.python.python_object import PyObjectPtr
@@ -255,8 +255,8 @@ struct Reader(Defaultable, Movable, Writable):
         """hiredis-style window feed: feed(data, start, length).
 
         Returns 0 on success, 1 for a non-buffer object, 2 for a bad offset,
-        3 for a bad length; the raw entry point raises with the messages the
-        Python wrapper used to produce.
+        3 for a bad length; the raw entry point raises TypeError/ValueError
+        directly.
         """
         var view = PyBuffer()
         var rc = external_call["PyObject_GetBuffer", c_int](
@@ -323,7 +323,7 @@ struct Reader(Defaultable, Movable, Writable):
         can hand memory back on demand.  The shrink is deliberately NOT done
         per reply: freeing a consumed arena forces a full re-grow (page
         faults plus copies) on the next feed, which measured 2.4x slower on
-        bulk arrays (1.36M page faults vs 4.6k, findings/6).
+        bulk arrays (1.36M page faults vs 4.6k).
         """
         var mb = Int(py=value)
         self_ptr[].maxbuf = mb
@@ -1001,7 +1001,7 @@ def _compact(mut r: Reader):
         # Capacity is kept, not shrunk to maxbuf: an idle shrink makes the
         # next feed re-grow from 16 KiB to the high-water mark, and that
         # churn (page faults plus repeated reallocs) cost 2.4x on a bulk-array
-        # loop while executing the same number of instructions (findings/6).
+        # loop while executing the same number of instructions.
         # set_maxbuf() releases an oversized idle arena on demand instead.
         return
     if r.consumed * 2 >= r.buf_len and r.buf_len > 1024:
@@ -1043,7 +1043,7 @@ def _pyerr_clear():
 def _list_new(n: Int) -> PyObjectPtr:
     # external_call, not the cpython binding object: Python().cpython() runs a
     # GIL check plus a runtime global lookup, and the container branches call
-    # it once per level (measured ~21% of a 50-deep nested reply, findings/6).
+    # it once per level (measured ~21% of a 50-deep nested reply).
     return external_call["PyList_New", PyObjectPtr](c_ssize_t(n))
 
 
@@ -1379,8 +1379,8 @@ def _double_parse(
 ) -> UInt8:
     """Validate a ',' double like the build path; ERR_NONE or an ERR_* code.
 
-    Shared with the highway scan so both modes reject the same inputs (the
-    scan used to skip strtod and accepted ",1e9999").
+    Shared with the highway scan so both modes reject the same inputs,
+    including ",1e9999".
     """
     if crlf - pstart >= 326:  # hiredis char buf[326]
         return ERR_DOUBLE_LARGE
@@ -1909,11 +1909,9 @@ def _scan_header(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth:
 def _scan_stack[HW: Bool](mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     """Resumable completeness scan with one frame per open container.
 
-    The flat scanner remembered only the next child at one level, so a nested
-    container spanning a chunk was walked from its start on every feed
-    (quadratic in its size).  Frames keep each open container's position, so
-    the next chunk resumes at the innermost pending element: hiredis' read
-    stack, minus the partially built reply objects.
+    Frames keep each open container's position, so the next chunk resumes at
+    the innermost pending element instead of re-walking the reply from its
+    start: hiredis' read stack, minus the partially built reply objects.
     """
     comptime hw = HW
     var base = r.consumed

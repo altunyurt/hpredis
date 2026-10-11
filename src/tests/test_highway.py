@@ -165,8 +165,8 @@ def test_real_statuses():
     ],
 )
 def test_highway_rejects_malformed_int_and_double(payload):
-    # the highway scan used to skip the int/double validation the build path
-    # applies, so it accepted replies that classic mode and hiredis reject
+    # the highway scan must apply the same int/double validation as the
+    # build path: classic mode and hiredis reject these replies
     r = hpredis.Reader(highway_mode=True)
     r.feed(payload)
     with pytest.raises(hpredis.ProtocolError):

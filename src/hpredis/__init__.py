@@ -1,4 +1,4 @@
-"""hpredis_vec — hiredis-py compatible Reader built on the Mojo core.
+"""hpredis — hiredis-py compatible RESP reader built on the Mojo core.
 
 Mirrors `hiredis.Reader` semantics verified against hiredis 3.4.2:
 - error replies return `replyError` instances (top-level and nested); a
