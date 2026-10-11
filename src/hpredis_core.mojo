@@ -1861,7 +1861,7 @@ def _scan_header(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth:
     return ScanHeader(ST_OK, after_int, children)
 
 
-def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
+def _scan_stack[HW: Bool](mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     """Resumable completeness scan with one frame per open container.
 
     The flat scanner remembered only the next child at one level, so a nested
@@ -1870,7 +1870,7 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     the next chunk resumes at the innermost pending element: hiredis' read
     stack, minus the partially built reply objects.
     """
-    var hw = r.highway
+    comptime hw = HW
     var base = r.consumed
     if len(r.scan_frames) == 0:
         var h0 = _scan_header(ptr, r.consumed, r.buf_len, 1)
@@ -1997,7 +1997,12 @@ def _scan_needs(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     var status: UInt8 = ST_OK
     if (t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP
             or t == TYPE_ATTR):
-        status = _scan_stack(r, ptr)
+        # comptime HW: the classic path compiles the slice recording out of
+        # the leaf-run loop instead of branching per element
+        if r.highway:
+            status = _scan_stack[True](r, ptr)
+        else:
+            status = _scan_stack[False](r, ptr)
     elif r.highway:
         # a leaf has no frame to resume from: re-walk it each chunk (it is
         # one item), but record its slice here, exactly once, when complete
