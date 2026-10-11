@@ -1,6 +1,6 @@
 [project]
 name = "hpredis"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mojo-based RESP reader compatible with hiredis-py"
 readme = "README.md"
 authors = [

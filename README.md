@@ -121,7 +121,7 @@ is a C extension for Python 3.9–3.15/PyPy on Linux, macOS, Windows, FreeBSD.
 Python 3.12 or newer.
 
 ```bash
-pip install hpredis-0.1.0-cp312-cp312-linux_x86_64.whl   # prebuilt wheel, no toolchain
+pip install hpredis-0.2.0-cp312-cp312-linux_x86_64.whl   # prebuilt wheel, no toolchain
 pip install .                                            # source build needs Mojo
 ```
 
