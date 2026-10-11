@@ -167,6 +167,8 @@ struct Reader(Defaultable, Movable, Writable):
     var wrapper_ref: Int
     # Py_TYPE(tuple): tells a status tuple from a finished reply
     var tuple_type: Int
+    # cached type objects for pack_command argument checks (0 = unresolved)
+    var pack_types: Int
     # highway mode routes gets() to the table/arena scan
     var highway: Bool
     # a build attempt hit an incomplete reply: scan before rebuilding
@@ -203,6 +205,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.not_enough_obj = 0
         self.wrapper_ref = 0
         self.tuple_type = 0
+        self.pack_types = 0
         self.highway = False
         self.needs_scan = False
         self.scan_frames = List[ScanFrame]()
@@ -619,6 +622,10 @@ struct Reader(Defaultable, Movable, Writable):
             self_ptr[].consumed = 0
         self_ptr[].needs_scan = False
         self_ptr[].scan_frames.clear()
+        if self_ptr[].pack_types != 0:
+            _ = external_call["free", NoneType](
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].pack_types))
+            self_ptr[].pack_types = 0
         return PythonObject(0)
 
     @staticmethod
@@ -3159,6 +3166,265 @@ def _raw_highway_arrow_views(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, Mu
     return out
 
 
+# === pack_command ===
+# One native pass: classify each argument, size the output, then write the
+# framing and memcpy the payloads into a single PyBytes object.
+
+
+struct PackItem(ImplicitlyCopyable):
+    var ptr: Int
+    var len: Int
+    var owned: Int  # owned PyObject* to release after the copy, 0 if none
+    var is_buf: Bool  # re-fetch the pointer with PyObject_GetBuffer in pass 2
+
+    def __init__(out self, ptr: Int, len: Int, owned: Int, is_buf: Bool):
+        self.ptr = ptr
+        self.len = len
+        self.owned = owned
+        self.is_buf = is_buf
+
+
+def _dec_digits(value: Int) -> Int:
+    var v = value
+    var n = 1
+    while v >= 10:
+        v //= 10
+        n += 1
+    return n
+
+
+def _write_dec(dst: Pointer[UInt8, MutAnyOrigin], cursor: Int, value: Int) -> Int:
+    var end = cursor + _dec_digits(value)
+    var i = end
+    var v = value
+    while i > cursor:
+        i -= 1
+        dst.unsafe_offset(i)[] = UInt8(48 + v % 10)
+        v //= 10
+    return end
+
+
+def _pack_cleanup(mut items: List[PackItem]):
+    for i in range(len(items)):
+        if items[i].owned != 0:
+            _decref(_int_ptr(items[i].owned))
+
+
+def _seq_item(seq: PyObjectPtr, i: Int, is_list: Bool) -> PyObjectPtr:
+    """Borrowed item i of a tuple or list (CPython layout: PyObject_VAR_HEAD
+    is 24 bytes, tuple items inline, list items behind ob_item)."""
+    var base = Int(seq) + 24
+    if is_list:
+        base = Pointer[Int, MutAnyOrigin](unsafe_from_address=base)[]
+    return _int_ptr(Pointer[Int, MutAnyOrigin](unsafe_from_address=base + i * 8)[])
+
+
+def _ob_type(obj: Int) -> Int:
+    """Py_TYPE: ob_type sits at offset 8 of every PyObject."""
+    return Pointer[Int, MutAnyOrigin](unsafe_from_address=obj + 8)[]
+
+
+def _is_sub(ty: Int, base: Int) -> Bool:
+    return Int(external_call["PyType_IsSubtype", c_int](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=ty),
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=base))) != 0
+
+
+def _pack_types(self_ptr: Pointer[mut=True, Reader, MutAnyOrigin]) raises -> Pointer[Int, MutAnyOrigin]:
+    """Type objects for the pack argument checks, resolved once per Reader.
+
+    Py*_Check are C macros, so the checks go through PyType_IsSubtype
+    against one instance of each type created here (slots: bytes, bytearray,
+    memoryview, str, int, float, bool, tuple, list).
+    """
+    if self_ptr[].pack_types != 0:
+        return Pointer[Int, MutAnyOrigin](unsafe_from_address=self_ptr[].pack_types)
+    var p = external_call["malloc", Pointer[UInt8, MutAnyOrigin]](c_size_t(9 * 8))
+    if Int(p) == 0:
+        raise Error("out of memory")
+    var ip = Pointer[Int, MutAnyOrigin](unsafe_from_address=Int(p))
+    var seed: UInt8 = 0
+    var sp = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=seed)))
+    var b = external_call["PyBytes_FromStringAndSize", PyObjectPtr](sp, c_ssize_t(0))
+    if Int(b) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(0)[] = _ob_type(Int(b))
+    var mv = external_call["PyMemoryView_FromObject", PyObjectPtr](b)
+    if Int(mv) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(2)[] = _ob_type(Int(mv))
+    _decref(mv)
+    _decref(b)
+    var ba = external_call["PyByteArray_FromStringAndSize", PyObjectPtr](sp, c_ssize_t(0))
+    if Int(ba) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(1)[] = _ob_type(Int(ba))
+    _decref(ba)
+    var u = external_call["PyUnicode_FromStringAndSize", PyObjectPtr](sp, c_ssize_t(0))
+    if Int(u) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(3)[] = _ob_type(Int(u))
+    _decref(u)
+    var i = external_call["PyLong_FromLong", PyObjectPtr](c_long(0))
+    if Int(i) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(4)[] = _ob_type(Int(i))
+    _decref(i)
+    var f = external_call["PyFloat_FromDouble", PyObjectPtr](Float64(0.0))
+    if Int(f) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(5)[] = _ob_type(Int(f))
+    _decref(f)
+    var bl = external_call["PyBool_FromLong", PyObjectPtr](c_long(1))
+    if Int(bl) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(6)[] = _ob_type(Int(bl))
+    _decref(bl)
+    var t = external_call["PyTuple_New", PyObjectPtr](c_ssize_t(0))
+    if Int(t) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(7)[] = _ob_type(Int(t))
+    _decref(t)
+    var li = external_call["PyList_New", PyObjectPtr](c_ssize_t(0))
+    if Int(li) == 0:
+        raise Error("pack_command type setup failed")
+    ip.unsafe_offset(8)[] = _ob_type(Int(li))
+    _decref(li)
+    self_ptr[].pack_types = Int(p)
+    return ip
+
+
+def _raw_pack_command(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = py_self
+    if Int(nargs) != 1:
+        return _raw_arity(1, Int(nargs))
+    var types: Pointer[Int, MutAnyOrigin]
+    try:
+        types = _pack_types(_raw_reader(py_self))
+    except e:
+        return raise_python_exception(e)
+    var seq = args.unsafe_offset(0)[]
+    var seq_ty = _ob_type(Int(seq))
+    var is_tuple = _is_sub(seq_ty, types.unsafe_offset(7)[])
+    var is_list = _is_sub(seq_ty, types.unsafe_offset(8)[])
+    if not is_tuple and not is_list:
+        return _raw_raise(ExceptionType.TypeError, "pack_command expects a tuple or list of arguments")
+    var n = 0
+    if is_list:
+        n = Int(external_call["PyList_Size", c_ssize_t](seq))
+    else:
+        n = Int(external_call["PyTuple_Size", c_ssize_t](seq))
+    if n < 0:
+        return PyObjectPtr()
+    var items = List[PackItem]()
+    var total = 1 + _dec_digits(n) + 2  # *N\r\n
+    for i in range(n):
+        var item = _seq_item(seq, i, is_list)
+        if Int(item) == 0:
+            _pack_cleanup(items)
+            return PyObjectPtr()
+        var ty = _ob_type(Int(item))
+        if _is_sub(ty, types.unsafe_offset(6)[]):  # bool before int
+            _pack_cleanup(items)
+            return _raw_raise(ExceptionType.TypeError, "invalid command argument type: bool")
+        var is_buf = (_is_sub(ty, types.unsafe_offset(0)[])
+                      or _is_sub(ty, types.unsafe_offset(1)[])
+                      or _is_sub(ty, types.unsafe_offset(2)[]))
+        if is_buf:
+            var view = PyBuffer()
+            if Int(external_call["PyObject_GetBuffer", c_int](
+                    item, Pointer(to=view), c_int(0))) != 0:  # PyBUF_SIMPLE
+                _pack_cleanup(items)
+                return PyObjectPtr()
+            var blen = Int(view.len)
+            var bptr = 0 if blen == 0 else Int(view.buf.value())
+            _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view))
+            items.append(PackItem(bptr, blen, 0, True))
+            total += 1 + _dec_digits(blen) + 2 + blen + 2
+            continue
+        if _is_sub(ty, types.unsafe_offset(3)[]):  # str
+            var size: c_ssize_t = 0
+            var p = external_call["PyUnicode_AsUTF8AndSize", Pointer[UInt8, MutAnyOrigin]](
+                item, Pointer(to=size))
+            if Int(p) == 0:
+                _pack_cleanup(items)
+                return PyObjectPtr()
+            items.append(PackItem(Int(p), Int(size), 0, False))
+            total += 1 + _dec_digits(Int(size)) + 2 + Int(size) + 2
+            continue
+        if _is_sub(ty, types.unsafe_offset(4)[]) or _is_sub(ty, types.unsafe_offset(5)[]):
+            var s = external_call["PyObject_Str", PyObjectPtr](item)
+            if Int(s) == 0:
+                _pack_cleanup(items)
+                return PyObjectPtr()
+            var size2: c_ssize_t = 0
+            var p2 = external_call["PyUnicode_AsUTF8AndSize", Pointer[UInt8, MutAnyOrigin]](
+                s, Pointer(to=size2))
+            if Int(p2) == 0:
+                _decref(s)
+                _pack_cleanup(items)
+                return PyObjectPtr()
+            items.append(PackItem(Int(p2), Int(size2), Int(s), False))
+            total += 1 + _dec_digits(Int(size2)) + 2 + Int(size2) + 2
+            continue
+        _pack_cleanup(items)
+        return _raw_raise(ExceptionType.TypeError, "invalid command argument type")
+    # PyBytes_FromStringAndSize(NULL, total) needs a null pointer, which
+    # Mojo's non-nullable Pointer cannot express; grow an owned 2-byte
+    # object with _PyBytes_Resize instead (every byte is overwritten below).
+    # Two bytes, not one: a 1-byte bytes object comes from CPython's
+    # single-character cache and has a refcount > 1, so it cannot be resized.
+    var seed: UInt64 = 0
+    var out = external_call["PyBytes_FromStringAndSize", PyObjectPtr](
+        Pointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=seed))), c_ssize_t(2))
+    if Int(out) == 0:
+        _pack_cleanup(items)
+        return PyObjectPtr()
+    var grown = out
+    if Int(external_call["_PyBytes_Resize", c_int](Pointer(to=grown), c_ssize_t(total))) != 0:
+        _pack_cleanup(items)
+        return PyObjectPtr()
+    out = grown
+    var dst = external_call["PyBytes_AsString", Pointer[UInt8, MutAnyOrigin]](out)
+    dst.unsafe_offset(0)[] = 42  # '*'
+    var cur = _write_dec(dst, 1, n)
+    dst.unsafe_offset(cur)[] = 13
+    dst.unsafe_offset(cur + 1)[] = 10
+    cur += 2
+    for i in range(len(items)):
+        var it = items[i]
+        dst.unsafe_offset(cur)[] = 36  # '$'
+        cur = _write_dec(dst, cur + 1, it.len)
+        dst.unsafe_offset(cur)[] = 13
+        dst.unsafe_offset(cur + 1)[] = 10
+        cur += 2
+        if it.len > 0:
+            var src = it.ptr
+            if it.is_buf:
+                var item2 = _seq_item(seq, i, is_list)
+                var view2 = PyBuffer()
+                if Int(external_call["PyObject_GetBuffer", c_int](
+                        item2, Pointer(to=view2), c_int(0))) != 0:
+                    _decref(out)
+                    _pack_cleanup(items)
+                    return PyObjectPtr()
+                src = Int(view2.buf.value())
+                _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](
+                    dst.unsafe_offset(cur),
+                    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=src), c_size_t(it.len))
+                _ = external_call["PyBuffer_Release", NoneType](Pointer(to=view2))
+            else:
+                _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](
+                    dst.unsafe_offset(cur),
+                    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=src), c_size_t(it.len))
+            cur += it.len
+        dst.unsafe_offset(cur)[] = 13
+        dst.unsafe_offset(cur + 1)[] = 10
+        cur += 2
+    _pack_cleanup(items)
+    return out
+
+
 # === Module entry ===
 
 @export
@@ -3186,7 +3452,8 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_py_c_method(_raw_highway_ints, "highway_ints") \
             .def_py_c_method(_raw_highway_floats, "highway_floats") \
             .def_py_c_method(_raw_highway_gather, "highway_gather") \
-            .def_py_c_method(_raw_highway_arrow_views, "highway_arrow_views")
+            .def_py_c_method(_raw_highway_arrow_views, "highway_arrow_views") \
+            .def_py_c_method(_raw_pack_command, "pack_command")
         return m.finalize()
     except e:
         abort(String("error creating hpredis_core:", e))

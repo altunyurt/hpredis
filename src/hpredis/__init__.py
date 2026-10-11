@@ -320,22 +320,5 @@ class Reader:
         return obj
 
 
-def pack_command(args):
-    """hiredis parity: serialize a command into RESP bytes."""
-    parts = [b"*%d\r\n" % len(args)]
-    for arg in args:
-        if isinstance(arg, bool):
-            raise TypeError(f"invalid command argument type: {type(arg)!r}")
-        if isinstance(arg, str):
-            arg = arg.encode()
-        elif isinstance(arg, memoryview):
-            arg = arg.cast("B")  # len() must count bytes, not elements
-        elif isinstance(arg, (int, float)):
-            arg = str(arg).encode()
-        elif not isinstance(arg, (bytes, bytearray)):
-            raise TypeError(f"invalid command argument type: {type(arg)!r}")
-        # buffer objects join as-is: coercing to bytes would copy the payload
-        parts.append(b"$%d\r\n" % len(arg))
-        parts.append(arg)
-        parts.append(b"\r\n")
-    return b"".join(parts)
+# Module-level function; the core ignores the Reader receiver.
+pack_command = _H.pack_command
