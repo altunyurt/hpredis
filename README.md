@@ -85,7 +85,7 @@ for latency on a 10-hit search.
 | Zero-copy payload reads through highway mode | no | yes, byte offsets into the receive buffer |
 | Bulk decoders over a highway table (`highway_ints`, `highway_floats`, `highway_gather`) | no | yes, one native pass |
 | Zero-copy Arrow `binary_view` import (`hpredis.arrow`, optional pyarrow) | no | yes, the arena is the data buffer |
-| redis-py 8.1 (sync client, pipelines, `decode_responses`) | yes | yes, tested through fakeredis |
+| redis-py 8.1 (sync + asyncio clients, pipelines, `decode_responses`) | yes | yes; the hiredis parser path is driven directly in tests, plus fakeredis integration |
 | Runtime dependencies | none | none |
 | Implementation | C extension, vendored hiredis | Mojo extension |
 | Python versions | 3.9 to 3.15, PyPy | 3.12 and newer |
@@ -176,7 +176,8 @@ uv build --wheel
 The suite covers the upstream hiredis-py Reader tests, a seeded differential
 fuzzer that compares hpredis against hiredis-py, memory and robustness
 regressions (leaks, hostile length headers, nesting depth, chunked feeds),
-highway mode, and redis-py integration through fakeredis.
+highway mode, redis-py's sync and asyncio hiredis parser paths, and
+redis-py integration through fakeredis.
 
 ## Status
 

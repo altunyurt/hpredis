@@ -28,4 +28,18 @@ pipe.set("k", 5)
 pipe.get("k")
 assert pipe.execute() == [True, b"5"]
 
+# 3) asyncio clients use the same parser slot: redis.asyncio picks the
+#    hiredis parser and constructs hiredis.Reader per connection.
+import asyncio  # noqa: E402
+
+
+async def async_main():
+    client = fakeredis.aioredis.FakeRedis()
+    await client.set("k", "v")
+    assert await client.get("k") == b"v"
+    await client.aclose()
+
+
+asyncio.run(async_main())
+
 print("drop-in OK: hiredis.Reader is", hiredis.Reader.__module__)
