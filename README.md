@@ -122,11 +122,19 @@ is a C extension for Python 3.9–3.15/PyPy on Linux, macOS, Windows, FreeBSD.
 
 ## Install
 
-Python 3.12 or newer.
+Python 3.12 or newer. No wheels are published yet; build one from the
+checkout, then install it (the install needs no toolchain):
 
 ```bash
-pip install hpredis-0.2.0-cp312-cp312-linux_x86_64.whl   # prebuilt wheel, no toolchain
-pip install .                                            # source build needs Mojo
+uv build --wheel
+pip install dist/hpredis-0.2.0-cp312-cp312-linux_x86_64.whl
+```
+
+Installing straight from the source tree needs the Mojo toolchain
+(`pip install mojo`), which `pip install .` invokes through `build.sh`:
+
+```bash
+pip install .
 ```
 
 ## Development
