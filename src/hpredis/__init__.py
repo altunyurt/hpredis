@@ -328,12 +328,13 @@ def pack_command(args):
             raise TypeError(f"invalid command argument type: {type(arg)!r}")
         if isinstance(arg, str):
             arg = arg.encode()
-        elif isinstance(arg, (bytes, bytearray, memoryview)):
-            arg = bytes(arg)
+        elif isinstance(arg, memoryview):
+            arg = arg.cast("B")  # len() must count bytes, not elements
         elif isinstance(arg, (int, float)):
             arg = str(arg).encode()
-        else:
+        elif not isinstance(arg, (bytes, bytearray)):
             raise TypeError(f"invalid command argument type: {type(arg)!r}")
+        # buffer objects join as-is: coercing to bytes would copy the payload
         parts.append(b"$%d\r\n" % len(arg))
         parts.append(arg)
         parts.append(b"\r\n")

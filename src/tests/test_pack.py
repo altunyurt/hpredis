@@ -45,3 +45,10 @@ def test_wrong_type():
 
     with pytest.raises(TypeError):
         hiredis.pack_command(("HSET", "foo", Bar()))
+
+
+def test_memoryview_framing_counts_bytes_not_elements():
+    # a non-'B' format must be framed by byte length, not element count
+    mv = memoryview(bytearray(range(16))).cast("I")  # 4 elements, 16 bytes
+    packed = hiredis.pack_command(("SET", b"k", mv))
+    assert packed == b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$16\r\n" + bytes(range(16)) + b"\r\n"
