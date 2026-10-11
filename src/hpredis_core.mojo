@@ -1692,7 +1692,7 @@ def _scan_resp[HIGHWAY: Bool](
     if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_ATTR:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
-        var count = _read_int(ptr, start + 1, end, after_int, status)
+        var count = _read_count_fast(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status == ST_PROTO_ERR:
@@ -1727,7 +1727,7 @@ def _scan_resp[HIGHWAY: Bool](
     if t == TYPE_SET:  # '~' set
         var after_int2 = start + 1
         var status2: UInt8 = ST_OK
-        var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
+        var count2 = _read_count_fast(ptr, start + 1, end, after_int2, status2)
         if status2 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status2 == ST_PROTO_ERR or count2 < 0:
@@ -1752,7 +1752,7 @@ def _scan_resp[HIGHWAY: Bool](
     if t == TYPE_MAP:  # '%' map
         var after_int3 = start + 1
         var status3: UInt8 = ST_OK
-        var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
+        var pairs = _read_count_fast(ptr, start + 1, end, after_int3, status3)
         if status3 == ST_INCOMPLETE:
             return ScanResult(ST_INCOMPLETE, start)
         if status3 == ST_PROTO_ERR or pairs < 0:
@@ -1859,7 +1859,7 @@ def _scan_header(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth:
     var t = ptr.unsafe_offset(start)[]
     var after_int = start + 1
     var status: UInt8 = ST_OK
-    var count = _read_int(ptr, start + 1, end, after_int, status)
+    var count = _read_count_fast(ptr, start + 1, end, after_int, status)
     if status == ST_INCOMPLETE:
         return ScanHeader(ST_INCOMPLETE, after_int, 0)
     if status == ST_PROTO_ERR:
