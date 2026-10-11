@@ -179,6 +179,9 @@ struct Reader(Defaultable, Movable, Writable):
     # refuses to resize an exported buffer (see _ensure_cap)
     var buf_obj: Int
     var highway_slices: List[ResponseSlice]
+    # end position of the last complete resumable scan: a resumed chunked
+    # highway reply builds its table from the slices that scan recorded
+    var scan_end: Int
 
     def __init__(out self):
         self.buf_addr = 0
@@ -205,6 +208,7 @@ struct Reader(Defaultable, Movable, Writable):
         self.scan_frames = List[ScanFrame]()
         self.buf_obj = 0
         self.highway_slices = List[ResponseSlice]()
+        self.scan_end = 0
 
     # === Python-facing methods ===
 
@@ -791,29 +795,39 @@ struct Reader(Defaultable, Movable, Writable):
             return Reader._not_enough_result(self_ptr)
         var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=self_ptr[].buf_addr)
         var start = self_ptr[].consumed
+        var scanned = False
         if self_ptr[].needs_scan:
-            # a previous attempt was incomplete: the classic resumable scan
-            # decides completeness at child boundaries, so a chunked reply no
-            # longer rewrites the whole table per feed.  Slices are recorded
-            # once, by the full walk below, after the reply is complete.
-            if _scan_needs(self_ptr[], ptr) == ST_INCOMPLETE:
+            # a previous attempt was incomplete: the resumable scan resumes at
+            # the innermost pending element and records the slices as it goes,
+            # so a chunked reply is walked once instead of once per chunk plus
+            # once to build the table.  The slice list survives across chunks;
+            # _compact() refuses to move the buffer while it is non-empty.
+            var st = _scan_needs(self_ptr[], ptr)
+            if st == ST_INCOMPLETE:
                 return Reader._not_enough_result(self_ptr)
             self_ptr[].needs_scan = False
-        self_ptr[].highway_slices.clear()
-        var res = _scan_highway(ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start, 1)
-        if res.status == ST_INCOMPLETE:
-            self_ptr[].needs_scan = True
+            if st == ST_OK:
+                self_ptr[].consumed = self_ptr[].scan_end
+                scanned = True
+            # ST_PROTO_ERR falls through to the full walk, which owns the
+            # exact error text (the resumable scan reports status only)
+        if not scanned:
             self_ptr[].highway_slices.clear()
-            return Reader._not_enough_result(self_ptr)
-        if res.status == ST_PROTO_ERR:
-            self_ptr[].proto_err = True
-            self_ptr[].proto_err_msg = _err_text(res.err_code, res.err_byte)
-            # 3-tuple: the only status marker highway_gets returns, so the
-            # wrapper can tell it from a (table, arena) result
-            return _hw_tuple(
-                _long(Int(ST_PROTO_ERR)),
-                _bytes_payload(self_ptr[].proto_err_msg), _none_payload())
-        self_ptr[].consumed = res.pos
+            var res = _scan_highway(
+                ptr, start, self_ptr[].buf_len, self_ptr[].highway_slices, start, 1)
+            if res.status == ST_INCOMPLETE:
+                self_ptr[].needs_scan = True
+                self_ptr[].highway_slices.clear()
+                return Reader._not_enough_result(self_ptr)
+            if res.status == ST_PROTO_ERR:
+                self_ptr[].proto_err = True
+                self_ptr[].proto_err_msg = _err_text(res.err_code, res.err_byte)
+                # 3-tuple: the only status marker highway_gets returns, so the
+                # wrapper can tell it from a (table, arena) result
+                return _hw_tuple(
+                    _long(Int(ST_PROTO_ERR)),
+                    _bytes_payload(self_ptr[].proto_err_msg), _none_payload())
+            self_ptr[].consumed = res.pos
         # Bound the arena like the classic path does, but only when no view is
         # alive: an exported bytearray must not be rewritten under its readers.
         if self_ptr[].consumed == self_ptr[].buf_len and not _arena_pinned(self_ptr[]):
@@ -928,6 +942,7 @@ def _arena_detach(mut r: Reader, want_cap: Int) raises:
     parsing continues in the new one.
     """
     var pending = r.buf_len - r.consumed
+    var shift = r.consumed
     var cap = want_cap if want_cap > pending else pending
     var fresh = _new_arena(cap, r.buf_addr + r.consumed, pending)
     _ = external_call["Py_DecRef", NoneType](
@@ -936,7 +951,11 @@ def _arena_detach(mut r: Reader, want_cap: Int) raises:
     r.buf_cap = cap
     r.buf_len = pending
     r.consumed = 0
-    r.scan_frames.clear()
+    # pending bytes moved to offset 0: absolute frame positions shift with
+    # them, and recorded slice offsets (relative to the reply start) do not
+    var nframes = len(r.scan_frames)
+    for i in range(nframes):
+        r.scan_frames[i].pos -= shift
     r.buf_addr = Int(_arena_ptr(r.buf_obj))
 
 
@@ -968,6 +987,12 @@ def _ensure_cap(mut r: Reader, needed: Int) raises:
 def _compact(mut r: Reader):
     """Drop consumed bytes once they dominate the buffer."""
     if r.consumed == 0:
+        return
+    # recorded highway slices are offsets from the reply start: while a
+    # chunked highway reply is still being scanned, moving the buffer would
+    # invalidate them (drain() is unreachable in highway mode, but keep the
+    # invariant here rather than in the wrapper)
+    if r.needs_scan and len(r.highway_slices) > 0:
         return
     if r.consumed == r.buf_len:
         r.buf_len = 0
@@ -1814,6 +1839,16 @@ def _scan_header(ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, depth:
             return ScanHeader(ST_PROTO_ERR, after_int, 0)
         if count > (end - after_int) // 3:
             return ScanHeader(ST_INCOMPLETE, after_int, 0)
+    elif t == TYPE_ATTR:  # '|' attribute: N key/value pairs are 2N children
+        if count > MAX_CONTAINER_ELEMENTS:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if count < 0:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        children = count * 2
+        if depth > MAX_DEPTH:
+            return ScanHeader(ST_PROTO_ERR, after_int, 0)
+        if children > (end - after_int) // 3:
+            return ScanHeader(ST_INCOMPLETE, after_int, 0)
     else:  # '*' / '>'
         if count < -1:
             return ScanHeader(ST_PROTO_ERR, after_int, 0)
@@ -1835,14 +1870,20 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     the next chunk resumes at the innermost pending element: hiredis' read
     stack, minus the partially built reply objects.
     """
+    var hw = r.highway
+    var base = r.consumed
     if len(r.scan_frames) == 0:
         var h0 = _scan_header(ptr, r.consumed, r.buf_len, 1)
         if h0.status == ST_INCOMPLETE:
             return ST_INCOMPLETE
         if h0.status == ST_PROTO_ERR:
             return ST_PROTO_ERR
+        if hw:
+            var l0 = h0.children if h0.children >= 0 else -1
+            _record_slice(r.highway_slices, 0, l0, ptr.unsafe_offset(r.consumed)[])
         if h0.children == -1 or h0.children == 0:
-            return ST_OK  # nil or empty container
+            r.scan_end = h0.after  # nil or empty container
+            return ST_OK
         r.scan_frames.append(ScanFrame(h0.after, h0.children))
     var none_slices = List[ResponseSlice]()
     while len(r.scan_frames) > 0:
@@ -1850,6 +1891,7 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
         if f.remaining == 0:
             # this container is complete: settle it into its parent
             if len(r.scan_frames) == 0:
+                r.scan_end = f.pos
                 return ST_OK
             var parent = r.scan_frames.pop()
             parent.pos = f.pos
@@ -1870,8 +1912,12 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
                 if lst != ST_OK or lblen < -1:
                     break
                 if lblen == -1:
+                    if hw:
+                        _record_slice(r.highway_slices, lp - base, -1, TYPE_BULK)
                     lp = lafter
                 elif lblen <= lend - lafter - 2:
+                    if hw:
+                        _record_slice(r.highway_slices, lafter - base, lblen, TYPE_BULK)
                     lp = lafter + lblen + 2
                 else:
                     break
@@ -1884,11 +1930,15 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
                 _ = _parse_int_line(ptr, lp + 1, lcrlf, lafter2, lst2)
                 if lst2 != ST_OK:
                     break
+                if hw:
+                    _record_slice(r.highway_slices, lp + 1 - base, lcrlf - (lp + 1), tb)
                 lp = lafter2
             elif tb == TYPE_SIMPLE or tb == TYPE_ERROR:
                 var lcrlf2 = _find_crlf(ptr, lp + 1, lend)
                 if lcrlf2 < 0:
                     break
+                if hw:
+                    _record_slice(r.highway_slices, lp + 1 - base, lcrlf2 - (lp + 1), tb)
                 lp = lcrlf2 + 2
             else:
                 break
@@ -1901,7 +1951,8 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
                 continue
         var t = ptr.unsafe_offset(f.pos)[]
         var child_depth = len(r.scan_frames) + 2
-        if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP:
+        if (t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP
+                or t == TYPE_ATTR):
             var h = _scan_header(ptr, f.pos, r.buf_len, child_depth)
             if h.status == ST_INCOMPLETE:
                 r.scan_frames.append(f)
@@ -1909,6 +1960,9 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
             if h.status == ST_PROTO_ERR:
                 r.scan_frames.clear()
                 return ST_PROTO_ERR
+            if hw:
+                var lh = h.children if h.children >= 0 else -1
+                _record_slice(r.highway_slices, f.pos - base, lh, t)
             if h.children == -1 or h.children == 0:
                 f.pos = h.after
                 f.remaining -= 1
@@ -1917,9 +1971,14 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
             r.scan_frames.append(f)
             r.scan_frames.append(ScanFrame(h.after, h.children))
             continue
-        # leaves (and '|' attributes, which the stack does not open) go through
-        # the recursive scanner, which allocates nothing
-        var child = _scan_resp[False](ptr, f.pos, r.buf_len, none_slices, 0, child_depth)
+        # leaves go through the recursive scanner, which allocates nothing.
+        # The stack opens every container type, so a partial recursive walk
+        # can never have recorded a header it would record again on resume.
+        var child: ScanResult
+        if hw:
+            child = _scan_resp[True](ptr, f.pos, r.buf_len, r.highway_slices, base, child_depth)
+        else:
+            child = _scan_resp[False](ptr, f.pos, r.buf_len, none_slices, 0, child_depth)
         if child.status == ST_PROTO_ERR:
             r.scan_frames.clear()
             return ST_PROTO_ERR
@@ -1936,8 +1995,15 @@ def _scan_needs(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
     """Scan the pending reply when a previous build came back incomplete."""
     var t = ptr.unsafe_offset(r.consumed)[]
     var status: UInt8 = ST_OK
-    if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP:
+    if (t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP
+            or t == TYPE_ATTR):
         status = _scan_stack(r, ptr)
+    elif r.highway:
+        # a leaf has no frame to resume from: re-walk it each chunk (it is
+        # one item), but record its slice here, exactly once, when complete
+        var hs = _scan_resp[True](ptr, r.consumed, r.buf_len, r.highway_slices, r.consumed, 1)
+        status = hs.status
+        r.scan_end = hs.pos
     else:
         var sc = _scan_node(ptr, r.consumed, r.buf_len, 1)
         status = sc.status

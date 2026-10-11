@@ -182,6 +182,11 @@ def test_highway_rejects_malformed_int_and_double(payload):
         b"*4\r\n$4\r\ndata\r\n$-1\r\n#t\r\n,1.5\r\n",
         b"*2\r\n$3\r\nfoo\r\n*2\r\n$1\r\nx\r\n=8\r\ntxt:abcd\r\n",
         b"*2\r\n*3\r\n*2\r\n$1\r\na\r\n:1\r\n%1\r\n$1\r\nk\r\n~1\r\n$1\r\nv\r\n#t\r\n>1\r\n$1\r\np\r\n",
+        # the resumable scan opens '|' attributes as containers too, and a
+        # nil container is a -1 row with no frame to resume from
+        b"|1\r\n$1\r\nk\r\n$1\r\nv\r\n",
+        b"*-1\r\n",
+        b"*2\r\n$1\r\na\r\n|1\r\n$1\r\nk\r\n$1\r\nv\r\n",
     ],
 )
 def test_highway_chunked_matches_single_feed(payload):
