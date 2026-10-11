@@ -1856,6 +1856,49 @@ def _scan_stack(mut r: Reader, ptr: Pointer[UInt8, MutAnyOrigin]) -> UInt8:
             parent.remaining -= 1
             r.scan_frames.append(parent)
             continue
+        # leaf run: advance over complete, valid scalars in a tight loop
+        # instead of a pop/append round trip per element
+        var lp = f.pos
+        var lrem = f.remaining
+        var lend = r.buf_len
+        while lrem > 0 and lp < lend:
+            var tb = ptr.unsafe_offset(lp)[]
+            if tb == TYPE_BULK:
+                var lafter = lp + 1
+                var lst: UInt8 = ST_OK
+                var lblen = _read_len_fast(ptr, lp + 1, lend, lafter, lst)
+                if lst != ST_OK or lblen < -1:
+                    break
+                if lblen == -1:
+                    lp = lafter
+                elif lblen <= lend - lafter - 2:
+                    lp = lafter + lblen + 2
+                else:
+                    break
+            elif tb == TYPE_INT:
+                var lcrlf = _find_crlf(ptr, lp + 1, lend)
+                if lcrlf < 0:
+                    break
+                var lafter2 = lcrlf
+                var lst2: UInt8 = ST_OK
+                _ = _parse_int_line(ptr, lp + 1, lcrlf, lafter2, lst2)
+                if lst2 != ST_OK:
+                    break
+                lp = lafter2
+            elif tb == TYPE_SIMPLE or tb == TYPE_ERROR:
+                var lcrlf2 = _find_crlf(ptr, lp + 1, lend)
+                if lcrlf2 < 0:
+                    break
+                lp = lcrlf2 + 2
+            else:
+                break
+            lrem -= 1
+        if lrem != f.remaining:
+            f.pos = lp
+            f.remaining = lrem
+            if lrem == 0:
+                r.scan_frames.append(f)
+                continue
         var t = ptr.unsafe_offset(f.pos)[]
         var child_depth = len(r.scan_frames) + 2
         if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_SET or t == TYPE_MAP:
@@ -2404,6 +2447,14 @@ def _raw_clear_decoding(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntr
         return raise_python_exception(e)
 
 
+def _raw_has_data(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    _ = args
+    if Int(nargs) != 0:
+        return _raw_arity(0, Int(nargs))
+    var r = _raw_reader(py_self)
+    return external_call["PyBool_FromLong", PyObjectPtr](c_long(1 if r[].buf_len > r[].consumed else 0))
+
+
 def _raw_buffered(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
     _ = args
     if Int(nargs) != 0:
@@ -2470,6 +2521,97 @@ def _raw_try_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedO
         return raise_python_exception(e)
 
 
+def _advance_to(mut r: Reader, newpos: Int):
+    """Consume up to newpos; drop the buffer when it empties (hot path)."""
+    r.consumed = newpos
+    if newpos == r.buf_len:
+        r.buf_len = 0
+        r.consumed = 0
+        if len(r.scan_frames) != 0:
+            r.scan_frames.clear()
+    elif r.consumed * 2 >= r.buf_len and r.buf_len > 1024:
+        _compact(r)
+
+
+def _gets_fast(self_ptr: Pointer[mut=True, Reader, MutAnyOrigin], sd: Int, mut handled: Bool) -> PyObjectPtr:
+    """Top-level +, :, $ replies with raw pointers only: no Node, no
+    PythonObject, no Python() handle.  handled=False sends the call down the
+    full path (incomplete, errors, containers, decode failures)."""
+    handled = False
+    ref r = self_ptr[]
+    if r.highway or r.proto_err or r.needs_scan or r.consumed >= r.buf_len:
+        return PyObjectPtr()
+    var ptr = Pointer[UInt8, MutAnyOrigin](unsafe_from_address=r.buf_addr)
+    var pos = r.consumed
+    var t = ptr.unsafe_offset(pos)[]
+    var decode = r.dec_enabled and sd != 0
+    if t == TYPE_SIMPLE:
+        var crlf = _find_crlf(ptr, pos + 1, r.buf_len)
+        if crlf < 0:
+            return PyObjectPtr()
+        var res: PyObjectPtr
+        if decode:
+            var cnv = DecodeCtx(True, r.dec_encoding, r.dec_errors, r.dec_kind, False, r.none_obj)
+            try:
+                res = _leaf_payload(ptr, pos + 1, crlf - pos - 1, cnv)
+            except:
+                return PyObjectPtr()
+            if cnv.failed:
+                _decref(res)
+                return PyObjectPtr()
+        else:
+            res = external_call["PyBytes_FromStringAndSize", PyObjectPtr](
+                ptr.unsafe_offset(pos + 1), c_ssize_t(crlf - pos - 1))
+        handled = True
+        _advance_to(r, crlf + 2)
+        return res
+    if t == TYPE_INT:
+        var crlf = _find_crlf(ptr, pos + 1, r.buf_len)
+        if crlf < 0:
+            return PyObjectPtr()
+        var after = crlf
+        var st: UInt8 = ST_OK
+        var v = _parse_int_line(ptr, pos + 1, crlf, after, st)
+        if st != ST_OK:
+            return PyObjectPtr()
+        handled = True
+        _advance_to(r, after)
+        return _long(v)
+    if t == TYPE_BULK:
+        var after = pos + 1
+        var st: UInt8 = ST_OK
+        var blen = _read_len_fast(ptr, pos + 1, r.buf_len, after, st)
+        if st != ST_OK or blen < -1:
+            return PyObjectPtr()
+        if blen == -1:
+            if r.none_obj == 0:
+                return PyObjectPtr()
+            var nn = _int_ptr(r.none_obj)
+            _incref(nn)
+            handled = True
+            _advance_to(r, after)
+            return nn
+        if blen > r.buf_len - after - 2:
+            return PyObjectPtr()
+        var res: PyObjectPtr
+        if decode:
+            var cnv = DecodeCtx(True, r.dec_encoding, r.dec_errors, r.dec_kind, False, r.none_obj)
+            try:
+                res = _leaf_payload(ptr, after, blen, cnv)
+            except:
+                return PyObjectPtr()
+            if cnv.failed:
+                _decref(res)
+                return PyObjectPtr()
+        else:
+            res = external_call["PyBytes_FromStringAndSize", PyObjectPtr](
+                ptr.unsafe_offset(after), c_ssize_t(blen))
+        handled = True
+        _advance_to(r, after + blen + 2)
+        return res
+    return PyObjectPtr()
+
+
 def _raw_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
     var sd = 1  # hiredis' shouldDecode default
     if Int(nargs) == 1:
@@ -2478,6 +2620,10 @@ def _raw_gets(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigi
             return PyObjectPtr()
     elif Int(nargs) != 0:
         return _raw_arity(1, Int(nargs))
+    var handled = False
+    var fast = _gets_fast(_raw_reader(py_self), sd, handled)
+    if handled:
+        return fast
     try:
         return Reader.gets(_raw_reader(py_self), sd).steal_data()
     except e:
@@ -2566,6 +2712,7 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_py_c_method(_raw_clear_decoding, "clear_decoding") \
             .def_py_c_method(_raw_drain, "drain") \
             .def_py_c_method(_raw_buffered, "buffered") \
+            .def_py_c_method(_raw_has_data, "has_data") \
             .def_py_c_method(_raw_highway_gets, "highway_gets")
         return m.finalize()
     except e:

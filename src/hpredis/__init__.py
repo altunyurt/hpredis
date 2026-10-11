@@ -111,7 +111,11 @@ class Reader:
         registered in ``__init__``.  The bound core method is cached in the
         instance dict, so this runs once per Reader.
         """
-        if name == "gets" or name == "feed":
+        if name == "len":
+            fn = self._core.buffered
+            self.__dict__[name] = fn
+            return fn
+        if name == "gets" or name == "feed" or name == "has_data":
             # bound to the core object, which holds the state; cached in the
             # instance dict so the lookup happens once per Reader
             fn = getattr(self._core, name)
@@ -215,13 +219,6 @@ class Reader:
 
     def getmaxbuf(self):
         return self._maxbuf
-
-    def len(self):
-        return self._core.buffered()
-
-    def has_data(self):
-        """redis-py 8 can_read() support."""
-        return self._core.buffered() > 0
 
     def close(self):
         """Release the core's arena now instead of at garbage collection.
