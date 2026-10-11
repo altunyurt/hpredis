@@ -27,6 +27,7 @@ dev = [
     "ipython>=9.17.1",
     "mojo>=1.1.0",
     "numpy>=2.5.3",
+    "pyarrow>=26.0.0",
     "pytest>=9.1.1",
     "pytest-memray>=1.11.0",
     "redis>=8.1.0",

@@ -40,6 +40,8 @@ _H = _core.Reader()
 highway_ints = _H.highway_ints        # (table, arena, first_row=-1) -> bytearray of int64 LE
 highway_floats = _H.highway_floats    # (table, arena, first_row=-1) -> bytearray of float64
 highway_gather = _H.highway_gather    # (table, arena, first_row=-1, width=0, out=None)
+# private: the Arrow adapter turns this into BinaryView buffers
+_highway_arrow_views = _H.highway_arrow_views  # (table, arena, first_row=-1) -> (views, validity)
 
 
 class HiredisError(Exception):

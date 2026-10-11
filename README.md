@@ -45,6 +45,10 @@ i = hpredis.Reader(highway_mode=True)
 i.feed(b"*3\r\n$1\r\n7\r\n$3\r\n-12\r\n$2\r\n42\r\n")
 it, ia = i.gets()
 nums = np.frombuffer(hpredis.highway_ints(it, ia), dtype="<i8")   # [7, -12, 42]
+
+# Zero-copy Arrow: the arena stays the BinaryView data buffer (needs pyarrow).
+from hpredis.arrow import binary_array
+col = binary_array(table, arena)      # pa.binary_view(), values point into arena
 ```
 
 ## Feature comparison
@@ -58,6 +62,7 @@ nums = np.frombuffer(hpredis.highway_ints(it, ia), dtype="<i8")   # [7, -12, 42]
 | Batched parse through `drain()` | no | yes, with an optional `max_replies` cap |
 | Zero-copy payload reads through highway mode | no | yes, byte offsets into the receive buffer |
 | Bulk decoders over a highway table (`highway_ints`, `highway_floats`, `highway_gather`) | no | yes, one native pass |
+| Zero-copy Arrow `binary_view` import (`hpredis.arrow`, optional pyarrow) | no | yes, the arena is the data buffer |
 | redis-py 8.1 (sync client, pipelines, `decode_responses`) | yes | yes, tested through fakeredis |
 | Runtime dependencies | none | none |
 | Implementation | C extension, vendored hiredis | Mojo extension |

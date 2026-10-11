@@ -3041,6 +3041,81 @@ def _raw_highway_gather(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntr
     return _int_ptr(out)
 
 
+def _raw_highway_arrow_views(py_self: PyObjectPtr, args: Pointer[PyObjectPtr, MutUntrackedOrigin], nargs: c_ssize_t) abi("C") -> PyObjectPtr:
+    """highway_arrow_views(table, arena, first_row=-1) -> (views, validity).
+
+    Arrow BinaryView layout in one native pass: n 16-byte views plus a
+    ceil(n/8) validity bitmap.  A view is int32 length, then 12 inline bytes
+    for length <= 12, else a 4-byte prefix, int32 buffer index (0 = arena)
+    and int32 absolute offset into the arena.  Scalar nil rows become Arrow
+    nulls; container rows are rejected.
+    """
+    _ = py_self
+    var tv = PyBuffer()
+    var av = PyBuffer()
+    var first = -1
+    var n = 0
+    if not _tbl_prep(args, Int(nargs), 3, tv, av, first, n):
+        return PyObjectPtr()
+    var views = 0
+    var valid = 0
+    try:
+        views = _new_arena(n * 16, 0, 0)
+        valid = _new_arena((n + 7) // 8, 0, 0)
+    except e:
+        if views != 0:
+            _decref(_int_ptr(views))
+        _tbl_release(tv)
+        _tbl_release(av)
+        return raise_python_exception(e)
+    var tp = _tbl_addr(tv)
+    var ap = _tbl_addr(av)
+    var alen = Int(av.len)
+    var vp = _arena_ptr(views)
+    var vb = _arena_ptr(valid)
+    _ = external_call["memset", Pointer[UInt8, MutAnyOrigin]](vp, c_int(0), c_size_t(n * 16))
+    _ = external_call["memset", Pointer[UInt8, MutAnyOrigin]](vb, c_int(255), c_size_t((n + 7) // 8))
+    for i in range(n):
+        var base = tp + (first + i) * TBL_ROW
+        var off = Pointer[Int, MutAnyOrigin](unsafe_from_address=base)[]
+        var ln = Pointer[Int, MutAnyOrigin](unsafe_from_address=base + 8)[]
+        var ty = Pointer[Int, MutAnyOrigin](unsafe_from_address=base + 16)[]
+        if _tbl_container(ty):
+            _decref(_int_ptr(views))
+            _decref(_int_ptr(valid))
+            _tbl_release(tv)
+            _tbl_release(av)
+            return _tbl_fail(3, first + i, "is a container")
+        if ln < 0:  # scalar nil -> Arrow null
+            var mask = UInt8(1) << UInt8(i % 8)
+            vb.unsafe_offset(i // 8)[] &= ~mask
+            continue
+        if off < 0 or off > alen or ln > alen - off:
+            _decref(_int_ptr(views))
+            _decref(_int_ptr(valid))
+            _tbl_release(tv)
+            _tbl_release(av)
+            return _tbl_fail(2, first + i, "")
+        var row = Int(vp) + i * 16
+        Pointer[Int32, MutAnyOrigin](unsafe_from_address=row)[] = Int32(ln)
+        if ln <= 12:
+            if ln > 0:
+                _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](
+                    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=row + 4),
+                    Pointer[UInt8, MutAnyOrigin](unsafe_from_address=ap + off), c_size_t(ln))
+        else:
+            _ = external_call["memcpy", Pointer[UInt8, MutAnyOrigin]](
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=row + 4),
+                Pointer[UInt8, MutAnyOrigin](unsafe_from_address=ap + off), c_size_t(4))
+            Pointer[Int32, MutAnyOrigin](unsafe_from_address=row + 12)[] = Int32(off)
+    _tbl_release(tv)
+    _tbl_release(av)
+    var out = _tuple_new(2)
+    _tuple_set(out, 0, _int_ptr(views))
+    _tuple_set(out, 1, _int_ptr(valid))
+    return out
+
+
 # === Module entry ===
 
 @export
@@ -3067,7 +3142,8 @@ def PyInit_hpredis_core() abi("C") -> PythonObject:
             .def_py_c_method(_raw_highway_gets, "highway_gets") \
             .def_py_c_method(_raw_highway_ints, "highway_ints") \
             .def_py_c_method(_raw_highway_floats, "highway_floats") \
-            .def_py_c_method(_raw_highway_gather, "highway_gather")
+            .def_py_c_method(_raw_highway_gather, "highway_gather") \
+            .def_py_c_method(_raw_highway_arrow_views, "highway_arrow_views")
         return m.finalize()
     except e:
         abort(String("error creating hpredis_core:", e))
