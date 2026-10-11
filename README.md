@@ -51,6 +51,28 @@ from hpredis.arrow import binary_array
 col = binary_array(table, arena)      # pa.binary_view(), values point into arena
 ```
 
+## Reading RediSearch replies (FT.SEARCH)
+
+A KNN reply is `[count, id, [field, value, ...], id, [...], ...]`, so the
+rows are heterogeneous: the table is the data.  Read it as a numpy array of
+`(offset, length, type)` triples and select the payloads you need instead of
+building a Python list per field:
+
+```python
+t, arena = reader.gets()
+rows = np.frombuffer(t, dtype="<i8").reshape(-1, 3)
+# payload rows are type '$' with length >= 0; filter to the 512-dim vectors
+payloads = rows[(rows[:, 2] == ord("$")) & (rows[:, 1] == 2048)]
+vecs = [np.frombuffer(arena, dtype=np.float32, offset=int(off), count=512)
+        for off, _ in payloads[:, :2]]
+```
+
+Container header rows carry their child count in the length column (`*`/`>`/
+`~`/`%`/`|`), so which document a field belongs to is recoverable from the
+same array; scalar nils have length -1.  The parse itself is microseconds on
+typical top-K replies, so reach for highway mode when the reply is large, not
+for latency on a 10-hit search.
+
 ## Feature comparison
 
 | | hiredis-py 3.4.2 | hpredis |
