@@ -102,11 +102,11 @@ FT.SEARCH. Each asserts its own result and runs in the test suite.
 
 | | hiredis-py 3.4.2 | hpredis |
 |---|---|---|
-| `Reader` API (`feed`, `gets`, `len`, `has_data`, `set_encoding`, `setmaxbuf`, `getmaxbuf`, `close`) | yes | yes |
+| `Reader` API (`feed`, `gets`, `len`, `has_data`, `set_encoding`, `setmaxbuf`, `getmaxbuf`) | yes | yes |
+| Extensions: `drain()` (batched parse, optional `max_replies`) and `close()` | no | yes |
 | `pack_command`, `HiredisError`, `ProtocolError`, `ReplyError`, `PushNotification` | yes | yes |
 | RESP2, and the RESP3 types redis-py uses (maps, sets, pushes, doubles, booleans, nulls, big numbers, verbatim strings, attributes) | yes | yes |
 | Error text, length caps, and nesting depth | reference | matching, checked by the tests and a differential fuzzer |
-| Batched parse through `drain()` | no | yes, with an optional `max_replies` cap |
 | Zero-copy payload reads through highway mode | no | yes, byte offsets into the receive buffer |
 | Bulk decoders over a highway table (`highway_ints`, `highway_floats`, `highway_gather`) | no | yes, one native pass |
 | Zero-copy Arrow `binary_view` import (`hpredis.arrow`, optional pyarrow) | no | yes, the arena is the data buffer |
