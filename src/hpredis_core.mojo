@@ -1481,6 +1481,51 @@ def _read_len_fast(
     return _read_int(ptr, start, end, out_end, status)
 
 
+def _read_count_fast(
+    ptr: Pointer[UInt8, MutAnyOrigin], start: Int, end: Int, mut out_end: Int, mut status: UInt8
+) -> Int:
+    """Non-negative container count in one pass (digits until CRLF, no memchr).
+
+    Falls back to the verified strict parser for '-', leading zeros, junk and
+    overflow, so semantics are unchanged for every non-hot input.  The common
+    "*0\r\n" is handled inline; other zero-led counts take the fallback.
+    """
+    if start < end:
+        var first = Int(ptr.unsafe_offset(start)[])
+        if 49 <= first <= 57:
+            var value = UInt64(first - 48)
+            var i = start + 1
+            while i < end:
+                var d = Int(ptr.unsafe_offset(i)[])
+                if d == CR:
+                    if i + 1 >= end:
+                        break
+                    if ptr.unsafe_offset(i + 1)[] != LF:
+                        break
+                    out_end = i + 2
+                    status = ST_OK
+                    return Int(value)
+                if not (48 <= d <= 57):
+                    break
+                if value > 1844674407370955161:
+                    break
+                value *= 10
+                if value > 18446744073709551615 - UInt64(d - 48):
+                    break
+                value += UInt64(d - 48)
+                if value > 9223372036854775807:
+                    # fall back to the strict parser, which caps at Int64
+                    break
+                i += 1
+        elif (first == 48 and start + 2 < end
+                and ptr.unsafe_offset(start + 1)[] == CR
+                and ptr.unsafe_offset(start + 2)[] == LF):
+            out_end = start + 3
+            status = ST_OK
+            return 0
+    return _read_int(ptr, start, end, out_end, status)
+
+
 def _parse_int_line(
     ptr: Pointer[UInt8, MutAnyOrigin], start: Int, crlf: Int, mut out_end: Int, mut status: UInt8
 ) -> Int:
@@ -2071,7 +2116,7 @@ def _parse_node(
     if t == TYPE_ARRAY or t == TYPE_PUSH or t == TYPE_ATTR:  # '*' / '>' push / '|' attribute
         var after_int = start + 1
         var status: UInt8 = ST_OK
-        var count = _read_int(ptr, start + 1, end, after_int, status)
+        var count = _read_count_fast(ptr, start + 1, end, after_int, status)
         if status == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status == ST_PROTO_ERR:
@@ -2248,7 +2293,7 @@ def _parse_node(
     if t == TYPE_SET:  # '~' set -> plain list (hiredis-py parity)
         var after_int2 = start + 1
         var status2: UInt8 = ST_OK
-        var count2 = _read_int(ptr, start + 1, end, after_int2, status2)
+        var count2 = _read_count_fast(ptr, start + 1, end, after_int2, status2)
         if status2 == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status2 == ST_PROTO_ERR or count2 < 0:
@@ -2287,7 +2332,7 @@ def _parse_node(
     if t == TYPE_MAP:  # '%' map -> dict (N key/value pairs)
         var after_int3 = start + 1
         var status3: UInt8 = ST_OK
-        var pairs = _read_int(ptr, start + 1, end, after_int3, status3)
+        var pairs = _read_count_fast(ptr, start + 1, end, after_int3, status3)
         if status3 == ST_INCOMPLETE:
             return _incomplete_node(start)
         if status3 == ST_PROTO_ERR or pairs < 0:
