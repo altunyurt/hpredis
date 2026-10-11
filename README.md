@@ -1,77 +1,102 @@
 # hpredis
 
-A RESP protocol reader for Python, written in Mojo.
+A drop-in replacement for hiredis-py, written in Mojo, with a zero-copy
+highway mode for bulk payloads.
 
-`hpredis.Reader` implements the same interface as `hiredis.Reader`, so
-existing hiredis-py code can switch by changing the import. The reader also
-has a highway mode that returns raw byte offsets into its receive buffer,
-which NumPy and native code can read without copying.
+## Drop-in
 
-## Aim
+```python
+import hpredis as hiredis
 
-The project aims to be a RESP reader that existing hiredis-py and redis-py
-users can adopt without rewriting code: the same constructor, reply types,
-error text, and edge cases. On top of that, highway mode hands large payloads
-to native consumers as byte offsets, so a vector can be read by NumPy or an
-extension without building a Python object per payload. The remaining work is
-listed in the Status section.
+r = hiredis.Reader()
+r.feed(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
+assert r.gets() == [b"hello", b"world"]
+```
+
+redis-py, before the first connection:
+
+```python
+import sys
+import hpredis
+
+sys.modules["hiredis"] = hpredis
+import redis
+```
+
+redis-py already imported:
+
+```python
+import hiredis
+import hpredis
+
+hiredis.Reader = hpredis.Reader
+hiredis.PushNotification = hpredis.PushNotification
+```
+
+`hpredis.__version__` is `3.4.2`, the hiredis-py release whose behavior it
+matches — the value redis-py checks before enabling its hiredis parser.
+
+## Highway mode
+
+`Reader(highway_mode=True)` returns `(table, arena)`: 24-byte `(offset,
+length, resp_type)` rows into a `bytearray` holding the reply. No Python
+object per payload.
 
 ```python
 import numpy as np
 import hpredis
 
-# Classic mode: the hiredis.Reader interface.
-r = hpredis.Reader()
-r.feed(b"*2\r\n$5\r\nhello\r\n$5\r\nworld\r\n")
-assert r.gets() == [b"hello", b"world"]
-
-# Highway mode: one call returns an offsets table plus the buffer.
 vec = np.arange(1536, dtype=np.float32).tobytes()
-h = hpredis.Reader(highway_mode=True)
-h.feed(b"$%d\r\n" % len(vec) + vec + b"\r\n")
-table, arena = h.gets()
-triples = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
-off, length, resp_type = triples[0]
+r = hpredis.Reader(highway_mode=True)
+r.feed(b"$%d\r\n" % len(vec) + vec + b"\r\n")
+table, arena = r.gets()
+off, length, _ = np.frombuffer(table, dtype="<i8").reshape(-1, 3)[0]
 arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
-
-# Bulk decoders: one native pass over the table, no per-row Python work.
-# highway_gather copies equal-length payloads back to back into a contiguous
-# array (or into `out`, e.g. pinned memory).  first_row=-1 auto-skips the
-# reply's container header and keeps a scalar reply's row.
-blob = hpredis.highway_gather(table, arena)   # same bytes as vec
-
-# highway_ints/highway_floats parse decimal payloads (SMEMBERS, ZRANGE, ...).
-i = hpredis.Reader(highway_mode=True)
-i.feed(b"*3\r\n$1\r\n7\r\n$3\r\n-12\r\n$2\r\n42\r\n")
-it, ia = i.gets()
-nums = np.frombuffer(hpredis.highway_ints(it, ia), dtype="<i8")   # [7, -12, 42]
-
-# Zero-copy Arrow: the arena stays the BinaryView data buffer (needs pyarrow).
-from hpredis.arrow import binary_array
-col = binary_array(table, arena)      # pa.binary_view(), values point into arena
 ```
 
-## Reading RediSearch replies (FT.SEARCH)
+Rows cover every item in wire order: payload slice, nil `-1`, bool its `t`/`f`
+byte, container a header row with its child count. A view keeps the arena
+alive, so payloads stay valid after the reader is collected or new data fed.
 
-A KNN reply is `[count, id, [field, value, ...], id, [...], ...]`, so the
-rows are heterogeneous: the table is the data.  Read it as a numpy array of
-`(offset, length, type)` triples and select the payloads you need instead of
-building a Python list per field:
+### Bulk decoders
+
+One native pass over the table:
 
 ```python
-t, arena = reader.gets()
-rows = np.frombuffer(t, dtype="<i8").reshape(-1, 3)
-# payload rows are type '$' with length >= 0; filter to the 512-dim vectors
-payloads = rows[(rows[:, 2] == ord("$")) & (rows[:, 1] == 2048)]
-vecs = [np.frombuffer(arena, dtype=np.float32, offset=int(off), count=512)
-        for off, _ in payloads[:, :2]]
+flat = hpredis.highway_gather(table, arena)        # equal-length payloads, contiguous
+out = np.empty_like(flat)
+hpredis.highway_gather(table, arena, -1, 1536 * 4, out)   # or into a buffer you own
+
+i = hpredis.Reader(highway_mode=True)              # decimal payloads -> int64/float64
+i.feed(b"*3\r\n$1\r\n7\r\n$3\r\n-12\r\n$2\r\n42\r\n")
+it, ia = i.gets()
+ints = np.frombuffer(hpredis.highway_ints(it, ia), dtype="<i8")   # [7, -12, 42]
 ```
 
-Container header rows carry their child count in the length column (`*`/`>`/
-`~`/`%`/`|`), so which document a field belongs to is recoverable from the
-same array; scalar nils have length -1.  The parse itself is microseconds on
-typical top-K replies, so reach for highway mode when the reply is large, not
-for latency on a 10-hit search.
+### Arrow
+
+```python
+from hpredis.arrow import binary_array
+
+col = binary_array(table, arena)   # pa.binary_view() over the arena, no copy
+```
+
+### FT.SEARCH
+
+A KNN reply is `[count, id, [field, value, ...], ...]`: heterogeneous rows, so
+select from the table instead of building a list per field.
+
+```python
+# table, arena from highway_gets() on the KNN reply
+rows = np.frombuffer(table, dtype="<i8").reshape(-1, 3)
+vecs = [np.frombuffer(arena, np.float32, offset=int(off), count=512)
+        for off, _ in rows[(rows[:, 2] == ord("$")) & (rows[:, 1] == 2048)][:, :2]]
+```
+
+## Examples
+
+[`examples/`](examples/): drop-in, numpy embeddings, Arrow/pandas/polars,
+FT.SEARCH. Each asserts its own result and runs in the test suite.
 
 ## Feature comparison
 
@@ -91,75 +116,13 @@ for latency on a 10-hit search.
 | Python versions | 3.9 to 3.15, PyPy | 3.12 and newer |
 | Platforms | Linux, macOS, Windows, FreeBSD | Linux wheel; source build needs the Mojo toolchain |
 
-## Using it as a drop-in
-
-Programs that import hiredis-py can switch by changing the import:
-
-```python
-import hpredis as hiredis
-```
-
-For redis-py, route the reader before the first connection is created:
-
-```python
-import sys
-import hpredis
-
-sys.modules["hiredis"] = hpredis
-import redis
-```
-
-If redis-py is already imported, replace the attributes it reads:
-
-```python
-import hiredis
-import hpredis
-
-hiredis.Reader = hpredis.Reader
-hiredis.PushNotification = hpredis.PushNotification
-```
-
-`hpredis.Reader` accepts the constructor arguments redis-py passes,
-including `protocolError`, `replyError`, `encoding`, `errors`, and
-`notEnoughData`. `hpredis.__version__` reports the hiredis-py release whose
-behavior it matches (3.4.2), which is the value redis-py checks before it
-enables its hiredis parser.
-
-## Examples
-
-Runnable scripts in [`examples/`](examples/): the hiredis drop-in and
-redis-py routing, embeddings into numpy, Arrow/pandas/polars dataframes, and
-an FT.SEARCH vector-search recipe. Each one asserts its own result and is
-run by the test suite.
-
-```bash
-python examples/numpy_embeddings.py
-```
-
-## Highway mode
-
-`Reader(highway_mode=True)` returns `(table, arena)` from `gets()`. The table
-holds 24-byte rows of little-endian int64 values `(offset, length, resp_type)`
-with offsets into the arena, a `bytearray` that holds the reply. A view of
-the arena keeps it alive, so payloads stay valid after the reader is
-collected or new data is fed. The rows cover every item in the reply in wire
-order: byte payloads carry a slice, nil has `length = -1`, booleans carry
-their `t` or `f` byte, and a container has a header row whose length is its
-child count.
-
 ## Install
 
-Python 3.12 or newer. A prebuilt wheel needs no toolchain:
+Python 3.12 or newer.
 
 ```bash
-pip install hpredis-0.1.0-cp312-cp312-linux_x86_64.whl
-```
-
-Installing from a source checkout requires the Mojo toolchain
-(`pip install mojo`), which `pip install .` invokes through `build.sh`:
-
-```bash
-pip install .
+pip install hpredis-0.1.0-cp312-cp312-linux_x86_64.whl   # prebuilt wheel, no toolchain
+pip install .                                            # source build needs Mojo
 ```
 
 ## Development
@@ -173,28 +136,20 @@ uv build --wheel
 
 ## Tests
 
-The suite covers the upstream hiredis-py Reader tests, a seeded differential
-fuzzer that compares hpredis against hiredis-py, memory and robustness
-regressions (leaks, hostile length headers, nesting depth, chunked feeds),
-highway mode, redis-py's sync and asyncio hiredis parser paths, and
-redis-py integration through fakeredis.
+Upstream hiredis-py Reader tests, a seeded differential fuzzer against
+hiredis-py, memory and robustness regressions, highway mode, redis-py's sync
+and asyncio hiredis parser paths, and fakeredis integration.
 
 ## Status
 
-Classic mode parses RESP2 and RESP3 and matches hiredis-py on the tested
-behavior and error cases. `feed()` and `gets()` are single native calls:
-every core method is registered through CPython's vectorcall slot instead of
-the Mojo binding trampoline, and `gets()` returns the finished object from
-the core, so a reply never re-enters Python. `drain()` still leads on large
-batches. The gap that remains is inside the core parser (Python object
-construction, nested containers), not the Mojo boundary. Planned work:
-Python 3.9 to 3.11 support, published wheels for more platforms, and a
-native `Reader` type to drop the last Python frame.
+Classic mode matches hiredis-py on RESP2/RESP3 behavior and errors; `feed()`
+and `gets()` are single native calls. The remaining gap is inside the core
+parser (object construction, nested containers), not the Mojo boundary.
+Planned: Python 3.9 to 3.11, more wheels, a native `Reader` type.
 
 ## Limitations
 
-- `setmaxbuf()` stores the hiredis-compatible value and uses it as the idle
-  buffer trim threshold. It does not reject large replies, matching hiredis.
-- Protocol error messages match hiredis byte for byte, including escapes.
-- Highway mode returns byte offsets for native consumers; classic mode is the
-  path for Python reply objects.
+- `setmaxbuf()` is the hiredis idle-trim threshold; it does not reject large
+  replies (hiredis parity).
+- Protocol error messages match hiredis byte for byte.
+- Highway mode is for native consumers; classic mode returns Python objects.
