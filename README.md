@@ -38,9 +38,14 @@ matches — the value redis-py checks before enabling its hiredis parser.
 
 ## Highway mode
 
-`Reader(highway_mode=True)` returns `(table, arena)`: 24-byte `(offset,
-length, resp_type)` rows into a `bytearray` holding the reply. No Python
-object per payload.
+`Reader(highway_mode=True)` returns `(table, arena)` — no Python object per
+payload. The names are ours:
+
+| name | meaning |
+|---|---|
+| `highway` | our name for the zero-copy path |
+| `table` | flat array of 24-byte `(offset, length, resp_type)` records, one per item in wire order — an iovec / scatter-gather list with a RESP type tag |
+| `arena` | the receive buffer holding the raw reply; named after arena allocators for its bulk lifetime — a view keeps it alive, and it is replaced, never freed per payload |
 
 ```python
 import numpy as np
@@ -55,8 +60,7 @@ arr = np.frombuffer(arena, dtype=np.float32, offset=off, count=length // 4)
 ```
 
 Rows cover every item in wire order: payload slice, nil `-1`, bool its `t`/`f`
-byte, container a header row with its child count. A view keeps the arena
-alive, so payloads stay valid after the reader is collected or new data fed.
+byte, container a header row with its child count.
 
 Highway pays off for many-payload replies (MGET, LRANGE): one table instead
 of one object per payload. For a single bulk reply, classic mode is faster —

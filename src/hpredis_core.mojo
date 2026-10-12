@@ -785,7 +785,9 @@ struct Reader(Defaultable, Movable, Writable):
 
     @staticmethod
     def highway_gets(self_ptr: Pointer[mut=True, Self, MutAnyOrigin]) raises -> PythonObject:
-        """One call per reply: (status, table, arena).
+        """One call per reply: (status, table, arena) — table is the flat
+        (offset, length, resp_type) record array, arena the receive buffer
+        that views keep alive.
 
         status 0: table is n*24 bytes of little-endian int64 triples
         (offset, length, resp_type) with absolute offsets into arena, and arena
